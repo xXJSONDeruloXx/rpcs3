@@ -26,7 +26,14 @@ void main()
 	}
 
 	ivec2 input_size = ivec2(params.InputOutputSize.xy);
-	vec2 source_position = (vec2(pixel) + vec2(0.5)) * vec2(input_size) / vec2(output_size);
+	// A depth allocation can lag or lead the active color extent during a
+	// dynamic-resolution step. The guest's active rectangle is top-left
+	// anchored: when the allocation is larger, do not sample the stale margin;
+	// when it is smaller, stretch the complete available depth into the color
+	// grid. This mirrors Beast's active-subrect policy without inventing a
+	// camera viewport that RSX never exposed to the host.
+	vec2 active_size = min(vec2(input_size), vec2(output_size));
+	vec2 source_position = (vec2(pixel) + vec2(0.5)) * active_size / vec2(output_size);
 	ivec2 source_pixel = clamp(ivec2(source_position), ivec2(0), input_size - ivec2(1));
 	imageStore(OutputDepth, pixel, vec4(texelFetch(InputDepth, source_pixel, 0).r, 0.0, 0.0, 1.0));
 }
