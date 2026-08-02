@@ -113,6 +113,7 @@ enum class emu_settings_type
 	DlssMotionDynamicMask,
 	DlssMotionFarRotation,
 	DlssMotionEdgeMode,
+	DlssMotionObjectVelocity,
 	DlssMidFrameInjection,
 	DlssFrameGeneration,
 	DlssFrameGenerationRawMotion,

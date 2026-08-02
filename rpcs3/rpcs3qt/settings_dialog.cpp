@@ -568,6 +568,7 @@ settings_dialog::settings_dialog(std::shared_ptr<gui_settings> gui_settings, std
 	EnhanceCheckBox(emu_settings_type::DlssMotionDynamicMask, ui->dlssMotionDynamicMask, tooltips.settings.output_scaling_mode);
 	EnhanceCheckBox(emu_settings_type::DlssMotionFarRotation, ui->dlssMotionFarRotation, tooltips.settings.output_scaling_mode);
 	m_emu_settings->EnhanceSpinBox(ui->dlssMotionEdgeMode, emu_settings_type::DlssMotionEdgeMode);
+	EnhanceCheckBox(emu_settings_type::DlssMotionObjectVelocity, ui->dlssMotionObjectVelocity, tooltips.settings.output_scaling_mode);
 	EnhanceCheckBox(emu_settings_type::DlssMidFrameInjection, ui->dlssMidFrameInjection, tooltips.settings.output_scaling_mode);
 	EnhanceCheckBox(emu_settings_type::DlssFrameGeneration, ui->dlssFrameGeneration, tooltips.settings.output_scaling_mode);
 	EnhanceCheckBox(emu_settings_type::DlssFrameGenerationRawMotion, ui->dlssFrameGenerationRawMotion, tooltips.settings.output_scaling_mode);
@@ -866,6 +867,7 @@ settings_dialog::settings_dialog(std::shared_ptr<gui_settings> gui_settings, std
 		ui->dlssMotionDynamicMask->setEnabled(dlss_selected);
 		ui->dlssMotionFarRotation->setEnabled(dlss_selected);
 		ui->dlssMotionEdgeMode->setEnabled(dlss_selected);
+		ui->dlssMotionObjectVelocity->setEnabled(dlss_selected);
 		ui->dlssMidFrameInjection->setEnabled(dlss_selected);
 		ui->dlssFrameGeneration->setEnabled(dlss_selected);
 		ui->dlssFrameGenerationRawMotion->setEnabled(dlss_selected && ui->dlssFrameGeneration->isChecked());

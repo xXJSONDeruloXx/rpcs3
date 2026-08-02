@@ -71,6 +71,7 @@ public:
 		u32 cr_pred_buffer_location = umax;        // Conditional rendering predicate
 		u32 vertex_buffers_location = umax;        // Vertex input streams (3)
 		u32 cbuf_location = umax;                  // Vertex program constants register file
+		u32 previous_cbuf_location = umax;         // Previous-frame constants for experimental object motion
 		u32 instanced_lut_buffer_location = umax;  // Instancing redirection table
 		u32 instanced_cbuf_location = umax;        // Instancing constants register file
 		u32 vtex_location[4];                      // Vertex textures (inf)

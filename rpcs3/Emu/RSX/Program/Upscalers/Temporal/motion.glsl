@@ -20,6 +20,7 @@ layout(std430, set = 0, binding = 5) buffer SceneChange
 } scene_change;
 layout(set = 0, binding = 6) uniform sampler2D PreviousMotionMetadata;
 layout(set = 0, binding = 7, r8) uniform writeonly image2D BiasTexture;
+layout(set = 0, binding = 8) uniform sampler2D ObjectMotionTexture;
 
 layout(push_constant) uniform PushConstants
 {
@@ -363,6 +364,27 @@ void main()
 			motion_bias = 0.0;
 		}
 	}
+
+	// Beast's optional coverage pass reports current-minus-previous clip-space
+	// motion for pixels belonging to an animated object. Convert that NDC delta
+	// into the render-pixel convention used by the rest of this shader and add it
+	// after camera/color estimation. A cleared coverage texture is zero, so the
+	// path is a no-op for uncovered pixels.
+	vec2 object_delta = vec2(0.0);
+	if (params.JitterDelta.w > 0.5)
+	{
+		vec2 object_ndc_delta = texelFetch(ObjectMotionTexture, pixel, 0).rg;
+		if (!isnan(object_ndc_delta.x) && !isnan(object_ndc_delta.y) &&
+			!isinf(object_ndc_delta.x) && !isinf(object_ndc_delta.y) &&
+			abs(object_ndc_delta.x) <= 1.0 && abs(object_ndc_delta.y) <= 1.0)
+		{
+			// Vulkan's generated clip path and Streamline use the same Y direction
+			// after the present-side jitter sign conversion.
+			object_delta = vec2(-0.5 * object_ndc_delta.x * params.InputOutputSize.x,
+				-0.5 * object_ndc_delta.y * params.InputOutputSize.y);
+		}
+	}
+	best_offset = clamp(best_offset + object_delta, vec2(-max_motion), vec2(max_motion));
 
 	float depth = params.Flags.y > 0.5 ? texture(DepthTexture, uv).r : 0.0;
 	imageStore(MotionTexture, pixel, vec4(best_offset, 0.0, 0.0));

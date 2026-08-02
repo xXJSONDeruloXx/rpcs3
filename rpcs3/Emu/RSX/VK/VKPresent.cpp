@@ -106,6 +106,7 @@ bool VKGSRender::reinitialize_swapchain()
 
 	// Drain all the queues
 	vk::get_streamline_dlss().device_wait_idle(*m_device);
+	reset_object_motion_resources();
 
 	// Reset frame context storage
 	for (auto& ctx : m_frame_context_storage)
@@ -230,6 +231,7 @@ void VKGSRender::advance_queued_frames()
 
 	m_queued_frames.push_back(m_current_frame);
 	ensure(m_queued_frames.size() <= m_max_async_frames);
+	advance_object_motion_frame();
 
 	m_current_queue_index = (m_current_queue_index + 1) % m_max_async_frames;
 	m_current_frame = &m_frame_context_storage[m_current_queue_index];
@@ -876,6 +878,23 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 			if (depth && depth->samples() == 1 && depth->width() != depth->height())
 			{
 				temporal_inputs.depth = depth;
+			}
+
+			if (g_cfg.video.dlss_motion_object_velocity.get() && m_object_motion_written &&
+				m_object_motion_coverage && m_object_motion_coverage->value &&
+				m_object_motion_depth_image == depth &&
+				m_object_motion_coverage->width() == image_to_flip->width() &&
+				m_object_motion_coverage->height() == image_to_flip->height())
+			{
+				// Later guest draws may have reopened the normal render pass after an
+				// object coverage rerender. End it before sampling the coverage image.
+				if (vk::is_renderpass_open(*m_current_command_buffer))
+				{
+					vk::end_renderpass(*m_current_command_buffer);
+				}
+				m_object_motion_coverage->change_layout(*m_current_command_buffer, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+				temporal_inputs.object_motion = m_object_motion_coverage.get();
+				temporal_inputs.object_motion_valid = true;
 			}
 		}
 

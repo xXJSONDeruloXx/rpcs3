@@ -111,7 +111,7 @@ namespace vk::temporal_camera
 	// motion pass. Keeping this structural validation in one header lets the
 	// draw path gate jitter to camera-like geometry without accepting UI,
 	// shadow-map, or arbitrary constant blocks.
-	inline bool capture(const std::array<u32[4], 512>& constants, float expected_aspect, matrix& result)
+	inline bool capture(const std::array<u32[4], 512>& constants, float expected_aspect, matrix& result, u32* result_slot = nullptr)
 	{
 		float best_aspect_error = std::numeric_limits<float>::max();
 		bool found = false;
@@ -144,6 +144,10 @@ namespace vk::temporal_camera
 				found = true;
 				best_aspect_error = aspect_error;
 				result = view_projection;
+				if (result_slot)
+				{
+					*result_slot = slot;
+				}
 			}
 		}
 

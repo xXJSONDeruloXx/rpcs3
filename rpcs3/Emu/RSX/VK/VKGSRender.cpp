@@ -9,6 +9,7 @@
 #include "VKCompute.h"
 #include "VKGSRender.h"
 #include "VKHelpers.h"
+#include "VKPipelineCompiler.h"
 #include "VKRenderPass.h"
 #include "VKResourceManager.h"
 #include "upscalers/temporal/camera_capture.h"
@@ -27,6 +28,7 @@
 #include "../Program/SPIRVCommon.h"
 
 #include "util/asm.hpp"
+#include "util/fnv_hash.hpp"
 #include <vulkan/vulkan_core.h>
 
 namespace
@@ -441,6 +443,408 @@ void VKGSRender::clear_temporal_depth_candidate()
 	}
 }
 
+void VKGSRender::reset_object_motion_resources()
+{
+	if (m_object_motion_fbo)
+	{
+		m_object_motion_fbo->release();
+		m_object_motion_fbo = nullptr;
+	}
+
+	if (m_object_motion_coverage)
+	{
+		if (m_object_motion_coverage->value && vk::get_resource_manager())
+		{
+			vk::get_resource_manager()->dispose(m_object_motion_coverage);
+		}
+		else
+		{
+			m_object_motion_coverage.reset();
+		}
+	}
+
+	m_object_motion_program_cache.clear();
+	m_object_motion_program = nullptr;
+	m_object_motion_vertex_program = nullptr;
+	m_object_motion_fragment_program = nullptr;
+	m_object_motion_pipeline_signature = 0;
+	m_object_motion_renderpass_key = 0;
+	m_object_motion_depth_image = nullptr;
+	m_object_motion_clear_pending = true;
+	m_object_motion_written = false;
+	m_object_motion_current_snapshots.clear();
+	m_object_motion_previous_snapshots.clear();
+	m_object_motion_current_counts.clear();
+	m_object_motion_current_snapshot_entries = 0;
+	m_object_motion_current_snapshot_bytes = 0;
+	m_current_transform_constants.clear();
+	m_vertex_draw_parameters_offset = 0;
+}
+
+void VKGSRender::advance_object_motion_frame()
+{
+	// Draw order is the only stable identity available for a generic RSX model.
+	// Keep the same key/ordinal sequence across two adjacent frames and use the
+	// prior packed transform block when an eligible draw is encountered.
+	m_object_motion_previous_snapshots = std::move(m_object_motion_current_snapshots);
+	m_object_motion_current_snapshots.clear();
+	m_object_motion_current_counts.clear();
+	m_object_motion_current_snapshot_entries = 0;
+	m_object_motion_current_snapshot_bytes = 0;
+	m_object_motion_clear_pending = true;
+	m_object_motion_written = false;
+}
+
+bool VKGSRender::try_object_motion_velocity(const vk::vertex_upload_info& upload_info)
+{
+	if (!g_cfg.video.dlss_motion_object_velocity.get())
+	{
+		return false;
+	}
+
+	const auto& draw_call = rsx::method_registers.current_draw_clause;
+	if (m_vertex_prog && m_fragment_prog && m_program)
+	{
+		usz key = rpcs3::fnv_seed;
+		auto add_key = [&key](u64 value)
+		{
+			key = rpcs3::hash64(key, value);
+		};
+
+		add_key(m_vertex_prog->id);
+		add_key(m_fragment_prog->id);
+		add_key(static_cast<u32>(draw_call.primitive));
+		add_key(static_cast<u32>(draw_call.command));
+		add_key(draw_call.get_elements_count());
+		add_key(draw_call.min_index());
+		add_key(upload_info.vertex_draw_count);
+		add_key(upload_info.first_vertex);
+		add_key(upload_info.vertex_index_base);
+		add_key(upload_info.vertex_index_offset);
+		add_key(upload_info.index_info.has_value() ? 1u : 0u);
+		add_key(m_framebuffer_layout.width);
+		add_key(m_framebuffer_layout.height);
+		add_key(static_cast<u32>(m_framebuffer_layout.target));
+		add_key(m_draw_buffers.empty() ? umax : m_framebuffer_layout.color_addresses[m_draw_buffers[0]]);
+		add_key(m_framebuffer_layout.zeta_address);
+		if (upload_info.index_info)
+		{
+			add_key(static_cast<u32>(std::get<1>(*upload_info.index_info)));
+		}
+
+		const u64 draw_key = static_cast<u64>(key);
+		const u32 ordinal = m_object_motion_current_counts[draw_key]++;
+		const bool eligible_draw = !is_current_program_interpreted() &&
+			m_draw_fbo &&
+			!(m_current_command_buffer->flags & (vk::command_buffer::cb_has_conditional_render | vk::command_buffer::cb_has_open_query)) &&
+			draw_call.is_single_draw() && draw_call.pass_count() == 1 && !draw_call.is_trivial_instanced_draw &&
+			m_draw_buffers.size() == 1 &&
+			!std::any_of(std::begin(m_vs_binding_table->vtex_location), std::end(m_vs_binding_table->vtex_location), [](u32 binding) { return binding != umax; }) &&
+			m_vs_binding_table->previous_cbuf_location != umax &&
+			!m_current_transform_constants.empty() &&
+			m_pipeline_properties.state.ms.rasterizationSamples == VK_SAMPLE_COUNT_1_BIT &&
+			rsx::method_registers.depth_test_enabled() && rsx::method_registers.depth_write_enabled() &&
+			m_fragment_prog->output_color_masks[0] != 0 &&
+			m_fragment_prog->output_color_masks[1] == 0 &&
+			m_fragment_prog->output_color_masks[2] == 0 &&
+			m_fragment_prog->output_color_masks[3] == 0;
+
+		// Keep a bounded ordinal table. Ineligible draws get an empty marker so
+		// later eligible draws retain their position without copying large constant
+		// blocks; once the cap is reached, the remaining draws conservatively fall
+		// back to the camera/color field.
+		constexpr usz max_object_motion_history_entries = 4096;
+		constexpr usz max_object_motion_history_bytes = 32 * 1024 * 1024;
+		if (m_object_motion_current_snapshot_entries < max_object_motion_history_entries)
+		{
+			if (eligible_draw && m_object_motion_current_snapshot_bytes + m_current_transform_constants.size() <= max_object_motion_history_bytes)
+			{
+				m_object_motion_current_snapshots[draw_key].push_back(m_current_transform_constants);
+				m_object_motion_current_snapshot_bytes += m_current_transform_constants.size();
+			}
+			else
+			{
+				m_object_motion_current_snapshots[draw_key].emplace_back();
+			}
+			++m_object_motion_current_snapshot_entries;
+		}
+
+		// The actual rerender is intentionally narrower than the history recorder.
+		// Recording ineligible draws preserves ordinal alignment when a game's
+		// material/depth state changes between frames.
+		if (!eligible_draw)
+		{
+			return false;
+		}
+
+		const auto previous_it = m_object_motion_previous_snapshots.find(draw_key);
+		if (previous_it == m_object_motion_previous_snapshots.end() || ordinal >= previous_it->second.size())
+		{
+			return false;
+		}
+
+		// Beast's variant changes only the object/palette inputs and keeps the
+		// current camera inputs. Replaying the entire previous RSX constant block
+		// would otherwise put camera motion into the object coverage, after which
+		// the temporal pass would add camera motion a second time. Require the same
+		// structural camera tuple used by the regular reprojection path and restore
+		// those twelve constants from the current frame below.
+		vk::temporal_camera::matrix camera_constants{};
+		u32 camera_slot = umax;
+		const float expected_aspect = m_framebuffer_layout.height
+			? static_cast<float>(m_framebuffer_layout.width) / m_framebuffer_layout.height
+			: 1.f;
+		if (!m_ctx || !m_framebuffer_layout.width || !m_framebuffer_layout.height ||
+			!vk::temporal_camera::capture(REGS(m_ctx)->transform_constants, expected_aspect, camera_constants, &camera_slot))
+		{
+			return false;
+		}
+
+		auto previous_constants = previous_it->second[ordinal];
+		if (previous_constants.empty() || previous_constants.size() != m_current_transform_constants.size())
+		{
+			return false;
+		}
+
+		for (u32 row = 0; row < 12; ++row)
+		{
+			const u32 original_slot = camera_slot + row;
+			usz compact_slot = original_slot;
+			if (!m_vertex_prog->has_indexed_constants)
+			{
+				const auto it = std::lower_bound(m_vertex_prog->constant_ids.begin(), m_vertex_prog->constant_ids.end(), static_cast<u16>(original_slot));
+				if (it == m_vertex_prog->constant_ids.end() || *it != original_slot)
+				{
+					continue;
+				}
+				compact_slot = static_cast<usz>(it - m_vertex_prog->constant_ids.begin());
+			}
+
+			const usz byte_offset = compact_slot * 16;
+			if (byte_offset + 16 <= previous_constants.size() && byte_offset + 16 <= m_current_transform_constants.size())
+			{
+				std::memcpy(previous_constants.data() + byte_offset, m_current_transform_constants.data() + byte_offset, 16);
+			}
+		}
+
+		auto* depth = m_rtts.m_bound_depth_stencil.second;
+		const u32 coverage_width = m_draw_fbo->width();
+		const u32 coverage_height = m_draw_fbo->height();
+		if (!depth || !depth->value || depth->samples() != 1 ||
+			depth->width() != coverage_width || depth->height() != coverage_height ||
+			!coverage_width || !coverage_height)
+		{
+			return false;
+		}
+
+		const auto* pdev = vk::get_current_renderer();
+		constexpr VkFormatFeatureFlags coverage_features =
+			VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
+			VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+			VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+		if (!pdev || (pdev->get_format_properties(VK_FORMAT_R16G16_SFLOAT).optimalTilingFeatures & coverage_features) != coverage_features)
+		{
+			return false;
+		}
+
+		if (!m_object_motion_coverage || !m_object_motion_coverage->value ||
+			m_object_motion_coverage->width() != coverage_width ||
+			m_object_motion_coverage->height() != coverage_height)
+		{
+			if (m_object_motion_fbo)
+			{
+				m_object_motion_fbo->release();
+				m_object_motion_fbo = nullptr;
+			}
+
+			if (m_object_motion_coverage)
+			{
+				if (m_object_motion_coverage->value && vk::get_resource_manager())
+				{
+					vk::get_resource_manager()->dispose(m_object_motion_coverage);
+				}
+				else
+				{
+					m_object_motion_coverage.reset();
+				}
+			}
+
+			m_object_motion_coverage = std::make_unique<vk::viewable_image>(
+				*pdev,
+				pdev->get_memory_mapping().device_local,
+				VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+				VK_IMAGE_TYPE_2D,
+				VK_FORMAT_R16G16_SFLOAT,
+				coverage_width, coverage_height, 1, 1, 1, VK_SAMPLE_COUNT_1_BIT,
+				VK_IMAGE_LAYOUT_UNDEFINED,
+				VK_IMAGE_TILING_OPTIMAL,
+				VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+				vk::VK_IMAGE_CREATE_ALLOW_NULL_RPCS3,
+				VMM_ALLOCATION_POOL_SWAPCHAIN,
+				RSX_FORMAT_CLASS_COLOR);
+
+			if (!m_object_motion_coverage->value)
+			{
+				m_object_motion_coverage.reset();
+				return false;
+			}
+
+			m_object_motion_coverage->set_debug_name("RPCS3 DLSS experimental object motion");
+			m_object_motion_clear_pending = true;
+			m_object_motion_written = false;
+			m_object_motion_renderpass_key = 0;
+			m_object_motion_depth_image = nullptr;
+		}
+
+		// The coverage rerender cannot be nested in the guest render pass. The
+		// depth attachment is preserved with a load operation and compared exactly.
+		if (vk::is_renderpass_open(*m_current_command_buffer))
+		{
+			vk::end_renderpass(*m_current_command_buffer);
+		}
+
+		if (depth->current_layout != VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+		{
+			depth->change_layout(*m_current_command_buffer, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+		}
+
+		if (m_object_motion_depth_image && m_object_motion_depth_image != depth)
+		{
+			// A same-sized auxiliary depth surface is not interchangeable with the
+			// scene surface. Drop the prior coverage before grafting against the new
+			// depth image.
+			m_object_motion_clear_pending = true;
+			m_object_motion_written = false;
+		}
+
+		if (m_object_motion_clear_pending || m_object_motion_coverage->current_layout == VK_IMAGE_LAYOUT_UNDEFINED)
+		{
+			m_object_motion_coverage->change_layout(*m_current_command_buffer, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+			VkClearColorValue clear{};
+			const VkImageSubresourceRange range{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+			vkCmdClearColorImage(*m_current_command_buffer, m_object_motion_coverage->value,
+				m_object_motion_coverage->current_layout, &clear, 1, &range);
+			m_object_motion_coverage->change_layout(*m_current_command_buffer, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+			m_object_motion_clear_pending = false;
+		}
+		else
+		{
+			m_object_motion_coverage->change_layout(*m_current_command_buffer, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+		}
+
+		std::vector<vk::image*> attachments{ m_object_motion_coverage.get(), depth };
+		const u64 renderpass_key = vk::get_renderpass_key(attachments);
+		if (!m_object_motion_fbo || m_object_motion_renderpass_key != renderpass_key ||
+			m_object_motion_depth_image != depth)
+		{
+			if (m_object_motion_fbo)
+			{
+				m_object_motion_fbo->release();
+			}
+
+			m_object_motion_renderpass_key = renderpass_key;
+			m_object_motion_depth_image = depth;
+			m_object_motion_fbo = vk::get_framebuffer(*m_device,
+				static_cast<u16>(coverage_width), static_cast<u16>(coverage_height), VK_FALSE,
+				vk::get_renderpass(*m_device, renderpass_key), attachments);
+			m_object_motion_fbo->add_ref();
+		}
+
+		vk::pipeline_props object_props = m_pipeline_properties;
+		object_props.renderpass_key = renderpass_key;
+		object_props.state.set_attachment_count(1);
+		object_props.state.set_color_mask(0, true, true, true, true);
+		object_props.state.cs.logicOpEnable = VK_FALSE;
+		object_props.state.att_state[0].blendEnable = VK_FALSE;
+		object_props.state.ds.depthTestEnable = VK_TRUE;
+		object_props.state.ds.depthCompareOp = VK_COMPARE_OP_EQUAL;
+		object_props.state.ds.depthWriteEnable = VK_FALSE;
+		object_props.state.ds.depthBoundsTestEnable = VK_FALSE;
+		object_props.state.ds.stencilTestEnable = VK_FALSE;
+
+		usz pipeline_signature = rpcs3::hash_struct<vk::pipeline_props>(object_props);
+		pipeline_signature = rpcs3::hash64(pipeline_signature, m_vertex_prog->id);
+		pipeline_signature = rpcs3::hash64(pipeline_signature, m_fragment_prog->id);
+		m_object_motion_pipeline_signature = static_cast<u64>(pipeline_signature);
+
+		auto program_it = m_object_motion_program_cache.find(m_object_motion_pipeline_signature);
+		if (program_it == m_object_motion_program_cache.end())
+		{
+			// Object variants are intentionally retained until the renderer is
+			// idle because Vulkan pipelines may still be referenced by in-flight
+			// command buffers. Bound the opt-in cache and fall back to the regular
+			// temporal field rather than allowing an unusually stateful game to
+			// grow it without limit.
+			constexpr usz max_object_motion_variants = 256;
+			if (m_object_motion_program_cache.size() >= max_object_motion_variants)
+			{
+				return false;
+			}
+
+			auto object_program = vk::get_pipe_compiler()->compile(
+				object_props, m_vertex_prog->handle, m_fragment_prog->handle,
+				vk::pipe_compiler::COMPILE_INLINE, {}, m_vertex_prog->uniforms, m_fragment_prog->uniforms);
+			if (!object_program)
+			{
+				return false;
+			}
+
+			program_it = m_object_motion_program_cache.emplace(
+				m_object_motion_pipeline_signature, std::move(object_program)).first;
+		}
+		m_object_motion_program = program_it->second.get();
+		m_object_motion_vertex_program = m_vertex_prog;
+		m_object_motion_fragment_program = m_fragment_prog;
+
+		const u64 previous_offset = m_transform_constants_allocator->alloc_bytes(previous_constants.size());
+		auto previous_mapping = m_transform_constants_ring_info.map(previous_offset, previous_constants.size());
+		std::memcpy(previous_mapping, previous_constants.data(), previous_constants.size());
+		m_transform_constants_ring_info.unmap();
+		const auto previous_buffer = m_transform_constants_ring_info.window<16>(
+			previous_offset, previous_constants.size(), m_device->gpu().get_limits().maxUniformBufferRange);
+		const u32 previous_constants_offset = static_cast<u32>((previous_offset - previous_buffer.offset) / 16);
+
+		m_object_motion_program->copy_descriptor_state(*m_program);
+		m_object_motion_program->bind_uniform(previous_buffer,
+			vk::glsl::binding_set_index_vertex, m_vs_binding_table->previous_cbuf_location);
+
+		const u32 push_constants[3] =
+		{
+			m_vertex_draw_parameters_offset,
+			1u,
+			previous_constants_offset
+		};
+
+		m_current_command_buffer->flags |= vk::command_buffer::cb_reload_dynamic_state;
+		vk::begin_renderpass(*m_current_command_buffer,
+			vk::get_renderpass(*m_device, renderpass_key), m_object_motion_fbo->value,
+			{ positionu{ 0u, 0u }, sizeu{ coverage_width, coverage_height } });
+		update_draw_state();
+		m_object_motion_program->bind(*m_current_command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS);
+		vkCmdPushConstants(*m_current_command_buffer, m_object_motion_program->layout(),
+			VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push_constants), push_constants);
+
+		if (!upload_info.index_info)
+		{
+			vkCmdDraw(*m_current_command_buffer, upload_info.vertex_draw_count, 1, 0, 0);
+		}
+		else
+		{
+			const VkIndexType index_type = std::get<1>(*upload_info.index_info);
+			const VkDeviceSize index_offset = std::get<0>(*upload_info.index_info);
+			vkCmdBindIndexBuffer(*m_current_command_buffer, m_index_buffer_ring_info.heap->value, index_offset, index_type);
+			vkCmdDrawIndexed(*m_current_command_buffer, upload_info.vertex_draw_count, 1, 0, 0, 0);
+		}
+
+		vk::end_renderpass(*m_current_command_buffer);
+		m_current_command_buffer->flags |= vk::command_buffer::cb_reload_dynamic_state;
+		m_object_motion_written = true;
+		return true;
+	}
+
+	return false;
+}
+
 void VKGSRender::track_temporal_depth_candidate()
 {
 	auto* depth = m_rtts.m_bound_depth_stencil.second;
@@ -735,7 +1139,10 @@ VKGSRender::VKGSRender(utils::serial* ar) noexcept : GSRender(ar)
 	else
 		m_vertex_cache = std::make_unique<vk::weak_vertex_cache>();
 
-	m_shaders_cache = std::make_unique<vk::shader_cache>(*m_prog_buffer, "vulkan", "v1.95");
+	// Shader interfaces now include the packed temporal motion varying and the
+	// extended draw push block. Bump the cache namespace so stale modules cannot
+	// be linked with the new vertex/fragment layouts.
+	m_shaders_cache = std::make_unique<vk::shader_cache>(*m_prog_buffer, "vulkan", "v1.96");
 
 	for (u32 i = 0; i < m_swapchain->get_swap_image_count(); ++i)
 	{
@@ -925,6 +1332,7 @@ VKGSRender::~VKGSRender()
 
 	//Wait for device to finish up with resources
 	vk::get_streamline_dlss().device_wait_idle(*m_device);
+	reset_object_motion_resources();
 
 	// Globals. TODO: Refactor lifetime management
 	if (auto async_scheduler = g_fxo->try_get<vk::AsyncTaskScheduler>())
@@ -2199,6 +2607,8 @@ void VKGSRender::load_program_env()
 
 		if (!io_buf.empty())
 		{
+			m_current_transform_constants.resize(io_buf.size());
+			std::memcpy(m_current_transform_constants.data(), io_buf.data(), io_buf.size());
 			m_transform_constants_ring_info.unmap();
 			m_xform_constants_dynamic_offset = mem_offset;
 
@@ -2309,6 +2719,13 @@ void VKGSRender::load_program_env()
 	if (m_vs_binding_table->cbuf_location != umax)
 	{
 		m_program->bind_uniform(m_vertex_constants_buffer_info, vk::glsl::binding_set_index_vertex, m_vs_binding_table->cbuf_location);
+		if (m_vs_binding_table->previous_cbuf_location != umax)
+		{
+			// The normal guest pipeline has no previous-frame object pass. Bind the
+			// current constants as a safe descriptor default; the experimental pass
+			// replaces this slot with its copied history buffer for eligible draws.
+			m_program->bind_uniform(m_vertex_constants_buffer_info, vk::glsl::binding_set_index_vertex, m_vs_binding_table->previous_cbuf_location);
+		}
 	}
 
 	if (m_shader_interpreter.is_interpreter(m_program))
@@ -2439,13 +2856,15 @@ void VKGSRender::update_vertex_env(u32 id, const vk::vertex_upload_info& vertex_
 	dst->fs_stipple_pattern_offset = fs_stipple_pattern_offset;
 
 	const u32 push_val = vertex_layout_offset + id;
+	m_vertex_draw_parameters_offset = push_val;
+	const u32 push_constants[3] = { push_val, 0u, 0u };
 	vkCmdPushConstants(
 		*m_current_command_buffer,
 		m_program->layout(),
-		VK_SHADER_STAGE_VERTEX_BIT,
+		VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
 		0,
-		4,
-		&push_val);
+		sizeof(push_constants),
+		push_constants);
 
 	// Now actually fill in the data
 	m_draw_processor.fill_vertex_layout_state(
@@ -2488,6 +2907,8 @@ void VKGSRender::patch_transform_constants(rsx::context* /*ctx*/, u32 index, u32
 
 	if (!iobuf.empty())
 	{
+		m_current_transform_constants.resize(iobuf.size());
+		std::memcpy(m_current_transform_constants.data(), iobuf.data(), iobuf.size());
 		m_transform_constants_ring_info.unmap();
 	}
 }

@@ -189,9 +189,9 @@ namespace vk
 		auto vk_prog = std::make_shared<VKVertexProgram>();
 		const u32 vertex_instruction_start = init(vk_prog, compiler_options);
 
-		null_prog.ctrl = (compiler_options & COMPILER_OPT_ENABLE_INSTANCING)
+		null_prog.ctrl = RSX_SHADER_CONTROL_INTERPRETER_MODEL | ((compiler_options & COMPILER_OPT_ENABLE_INSTANCING)
 			? RSX_SHADER_CONTROL_INSTANCED_CONSTANTS
-			: 0;
+			: 0);
 		VKVertexDecompilerThread comp(null_prog, shader_str, arr, *vk_prog);
 
 		// Initialize compiler properties

@@ -114,6 +114,7 @@ const std::map<emu_settings_type, cfg_location> settings_location =
 	{ emu_settings_type::DlssMotionDynamicMask,     get_cfg_location(local_cfg.video.dlss_motion_dynamic_mask) },
 	{ emu_settings_type::DlssMotionFarRotation,     get_cfg_location(local_cfg.video.dlss_motion_far_rotation) },
 	{ emu_settings_type::DlssMotionEdgeMode,        get_cfg_location(local_cfg.video.dlss_motion_edge_mode) },
+	{ emu_settings_type::DlssMotionObjectVelocity, get_cfg_location(local_cfg.video.dlss_motion_object_velocity) },
 	{ emu_settings_type::DlssMidFrameInjection,     get_cfg_location(local_cfg.video.dlss_mid_frame_injection) },
 	{ emu_settings_type::DlssFrameGeneration,       get_cfg_location(local_cfg.video.dlss_frame_generation) },
 	{ emu_settings_type::DlssFrameGenerationRawMotion, get_cfg_location(local_cfg.video.dlss_frame_generation_raw_motion) },

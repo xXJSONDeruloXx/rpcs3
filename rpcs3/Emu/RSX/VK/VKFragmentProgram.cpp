@@ -180,11 +180,32 @@ void VKFragmentDecompilerThread::insertOutputs(std::stringstream & OS)
 
 		OS << "layout(location=" << std::to_string(output_index++) << ") " << "out vec4 " << table[i].first << ";\n";
 		vk_prog->output_color_masks[i] = -1;
+		if (i == 0)
+		{
+			m_has_output0 = true;
+		}
 	}
 }
 
 void VKFragmentDecompilerThread::insertConstants(std::stringstream & OS)
 {
+	OS << "layout(push_constant) uniform push_constants_block\n"
+		"{\n"
+		"\tuint draw_parameters_offset;\n"
+		"\tuint object_motion_mode;\n"
+		"\tuint previous_xform_constants_offset;\n"
+		"};\n\n";
+
+	inputs.push_back(vk::glsl::program_input
+	{
+		.domain = glsl::glsl_fragment_program,
+		.type = vk::glsl::input_type_push_constant,
+		.bound_data = vk::glsl::push_constant_ref{ .offset = 0, .size = 12 },
+		.set = vk::glsl::binding_set_index_fragment,
+		.location = umax,
+		.name = "push_constants_block"
+	});
+
 	// Fixed inputs from shader decompilation process
 	for (const ParamType& PT : m_parr.params[PF_PARAM_UNIFORM])
 	{
@@ -262,18 +283,31 @@ void VKFragmentDecompilerThread::insertConstants(std::stringstream & OS)
 		));
 	}
 
-	// Draw params are always provided by vertex program. Instead of pointer chasing, they're provided as varyings.
-	if (!(m_prog.ctrl & RSX_SHADER_CONTROL_INTERPRETER_MODEL))
+	if (m_prog.ctrl & RSX_SHADER_CONTROL_INTERPRETER_MODEL)
 	{
 		OS <<
-			"layout(location=" << vk::get_varying_register_location("usr") << ") in flat uvec4 draw_params_payload;\n\n";
+			"#define _fs_constants_offset draw_params_payload.x\n"
+			"#define _fs_context_offset draw_params_payload.y\n"
+			"#define _fs_texture_base_index draw_params_payload.z\n"
+			"#define _fs_stipple_pattern_array_offset draw_params_payload.w\n\n";
 	}
-
-	OS <<
-		"#define _fs_constants_offset draw_params_payload.x\n"
-		"#define _fs_context_offset draw_params_payload.y\n"
-		"#define _fs_texture_base_index draw_params_payload.z\n"
-		"#define _fs_stipple_pattern_array_offset draw_params_payload.w\n\n";
+	else
+	{
+		// Native VS/FS pairs share the draw-parameter SSBO through set 0 binding 2.
+		// The vertex-side program input advertises the fragment stage as well, so
+		// this does not create a duplicate descriptor slot in the unified layout.
+		OS <<
+			"layout(std430, set=0, binding=2) readonly restrict buffer DrawParametersBuffer\n"
+			"{\n"
+			"\tdraw_parameters_t draw_parameters[];\n"
+			"};\n\n"
+			"layout(location=15) noperspective in vec4 mvpp_clip;\n\n"
+			"#define get_draw_params() draw_parameters[draw_parameters_offset]\n"
+			"#define _fs_constants_offset get_draw_params().fs_constants_offset\n"
+			"#define _fs_context_offset get_draw_params().fs_context_offset\n"
+			"#define _fs_texture_base_index get_draw_params().fs_texture_base_index\n"
+			"#define _fs_stipple_pattern_array_offset get_draw_params().fs_stipple_pattern_offset\n\n";
+	}
 
 	if (!properties.constant_offsets.empty())
 	{
@@ -511,6 +545,18 @@ void VKFragmentDecompilerThread::insertMainEnd(std::stringstream & OS)
 	}
 
 	glsl::insert_rop(OS, m_shader_props);
+
+	if (m_has_output0 && !(m_prog.ctrl & RSX_SHADER_CONTROL_INTERPRETER_MODEL))
+	{
+		OS << "\tif (object_motion_mode != 0u)\n"
+			"\t{\n"
+			"\t\tvec2 current_ndc = mvpp_clip.xy;\n"
+			"\t\tvec2 previous_ndc = mvpp_clip.zw;\n"
+			"\t\tvec2 object_delta = current_ndc - previous_ndc;\n"
+			"\t\tif (!isnan(object_delta.x) && !isnan(object_delta.y) && !isinf(object_delta.x) && !isinf(object_delta.y))\n"
+				"\t\t\tocol0 = vec4(clamp(object_delta, vec2(-1.0), vec2(1.0)), 0.0, 1.0);\n"
+			"\t}\n";
+	}
 
 	if (m_prog.ctrl & CELL_GCM_SHADER_CONTROL_DEPTH_EXPORT)
 	{

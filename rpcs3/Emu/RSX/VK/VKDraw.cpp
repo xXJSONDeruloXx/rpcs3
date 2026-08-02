@@ -1341,6 +1341,15 @@ bool VKGSRender::bind_interpreter_texture_env()
 		}
 	}
 
+	// Beast's optional MV++ analogue rerenders this exact single draw against
+	// the just-written depth buffer using the previous packed transform block.
+	// It is deliberately after the authoritative guest draw so failed coverage
+	// never changes guest color/depth output.
+	if (g_cfg.video.dlss_motion_object_velocity.get())
+	{
+		try_object_motion_velocity(upload_info);
+	}
+
 	m_frame_stats.draw_exec_time += m_profiler.duration();
 }
 

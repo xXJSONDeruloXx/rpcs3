@@ -161,7 +161,8 @@ namespace vk
 			std::array<float, 32>& constants, const size2u& input_size, const size2u& output_size,
 			bool reset, bool has_depth, const std::array<float, 16>* clip_to_previous,
 			float jitter_delta_x, float jitter_delta_y, bool generate_motion_bias,
-			bool dynamic_mask, bool far_rotation, u32 edge_mode, float max_motion)
+			bool dynamic_mask, bool far_rotation, u32 edge_mode, float max_motion,
+			bool object_motion_valid)
 		{
 			constants[0] = static_cast<float>(input_size.width);
 			constants[1] = static_cast<float>(input_size.height);
@@ -174,7 +175,7 @@ namespace vk
 			constants[8] = jitter_delta_x;
 			constants[9] = jitter_delta_y;
 			constants[10] = generate_motion_bias ? 1.f : 0.f;
-			constants[11] = 0.f;
+			constants[11] = object_motion_valid ? 1.f : 0.f;
 			constants[28] = dynamic_mask ? 1.f : 0.f;
 			constants[29] = far_rotation ? 1.f : 0.f;
 			constants[30] = static_cast<float>(std::min<u32>(edge_mode, 2));
@@ -424,6 +425,8 @@ namespace vk
 				"PreviousMotionMetadata", vk::glsl::input_type_texture, 0, 6));
 			result.push_back(glsl::program_input::make(::glsl::glsl_compute_program,
 				"BiasTexture", vk::glsl::input_type_storage_texture, 0, 7));
+			result.push_back(glsl::program_input::make(::glsl::glsl_compute_program,
+				"ObjectMotionTexture", vk::glsl::input_type_texture, 0, 8));
 			return result;
 		}
 
@@ -438,6 +441,7 @@ namespace vk
 			m_program->bind_uniform({ *m_scene_change_buffer, 0, scene_change_counter_count * sizeof(u32) }, 0, 5);
 			m_program->bind_uniform({ *m_previous_motion_image, *m_sampler }, 0, 6);
 			m_program->bind_uniform({ *m_motion_bias_image }, 0, 7);
+			m_program->bind_uniform({ *m_object_motion_image, *m_sampler }, 0, 8);
 		}
 
 		void motion_pass::run(const vk::command_buffer& cmd,
@@ -448,6 +452,7 @@ namespace vk
 			vk::viewable_image* motion_meta,
 			vk::viewable_image* previous_motion,
 			vk::viewable_image* motion_bias,
+			vk::viewable_image* object_motion,
 			const size2u& input_size,
 			const size2u& output_size,
 			const std::array<float, 16>* clip_to_previous,
@@ -459,6 +464,7 @@ namespace vk
 			float max_motion,
 			const vk::buffer* scene_change_buffer,
 			bool generate_motion_bias,
+			bool object_motion_valid,
 			bool reset)
 		{
 			const auto remap = rsx::default_remap_vector.with_encoding(VK_REMAP_IDENTITY);
@@ -471,6 +477,9 @@ namespace vk
 			m_motion_meta_image = motion_meta->get_view(remap);
 			m_previous_motion_image = previous_motion->get_view(remap);
 			m_motion_bias_image = motion_bias->get_view(remap);
+			m_object_motion_image = (object_motion && object_motion->value)
+				? object_motion->get_view(remap)
+				: m_previous_motion_image;
 			m_scene_change_buffer = scene_change_buffer;
 
 			if (!m_program)
@@ -484,7 +493,8 @@ namespace vk
 				VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
 			push_motion_constants(cmd, m_program.get(), m_constants, input_size, output_size, reset, depth != nullptr,
 				clip_to_previous, jitter_delta_x, jitter_delta_y, generate_motion_bias,
-				dynamic_mask, far_rotation, edge_mode, max_motion);
+				dynamic_mask, far_rotation, edge_mode, max_motion,
+				object_motion_valid && object_motion && object_motion->value);
 			compute_task::run(cmd, utils::aligned_div(input_size.width, temporal_workgroup_size),
 				utils::aligned_div(input_size.height, temporal_workgroup_size), 1);
 			insert_buffer_memory_barrier(cmd, m_scene_change_buffer->value, 0,
@@ -1170,11 +1180,13 @@ namespace vk
 
 		vk::get_compute_task<vk::temporal::motion_pass>()->run(cmd, src, m_previous_color.get(),
 			has_depth ? depth_for_temporal : nullptr, m_motion.get(), m_motion_meta.get(), m_previous_motion.get(), m_motion_bias.get(),
+			inputs.object_motion_valid ? inputs.object_motion : nullptr,
 			input_size, dlss_output_size,
 			has_camera_pair ? &clip_to_previous : nullptr, jitter_delta_x, jitter_delta_y,
 			g_cfg.video.dlss_motion_dynamic_mask.get(), g_cfg.video.dlss_motion_far_rotation.get(),
 			g_cfg.video.dlss_motion_edge_mode.get(), has_camera_pair ? 128.f : 32.f,
-			prepare_scene_change_buffer(input_size), g_cfg.video.dlss_motion_bias.get(), reset);
+			prepare_scene_change_buffer(input_size), g_cfg.video.dlss_motion_bias.get(),
+			inputs.object_motion_valid, reset);
 		insert_temporal_write_read_barrier(cmd, *m_motion);
 		insert_temporal_write_read_barrier(cmd, *m_motion_meta);
 		insert_temporal_write_read_barrier(cmd, *m_motion_bias);

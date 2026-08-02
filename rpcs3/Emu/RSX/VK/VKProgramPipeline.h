@@ -220,6 +220,10 @@ namespace vk
 
 			program& link(bool separate_stages);
 			program& bind(const vk::command_buffer& cmd, VkPipelineBindPoint bind_point);
+			// Copy the currently bound descriptor values into a compatible pipeline
+			// variant. Descriptor sets are layout-specific, so only the value slots
+			// are copied; the destination commits its own set on the next bind.
+			void copy_descriptor_state(const program& source);
 
 			bool has_uniform(program_input_type type, std::string_view uniform_name);
 			std::pair<u32, u32> get_uniform_location(::glsl::program_domain domain, program_input_type type, std::string_view uniform_name);

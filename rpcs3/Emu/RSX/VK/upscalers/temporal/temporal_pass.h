@@ -40,6 +40,7 @@ namespace vk
 			const vk::image_view* m_motion_meta_image = nullptr;
 			const vk::image_view* m_previous_motion_image = nullptr;
 			const vk::image_view* m_motion_bias_image = nullptr;
+			const vk::image_view* m_object_motion_image = nullptr;
 			const vk::buffer* m_scene_change_buffer = nullptr;
 			std::array<float, 32> m_constants{};
 
@@ -55,6 +56,7 @@ namespace vk
 				vk::viewable_image* motion_meta,
 				vk::viewable_image* previous_motion,
 				vk::viewable_image* motion_bias,
+				vk::viewable_image* object_motion,
 				const size2u& input_size,
 				const size2u& output_size,
 				const std::array<float, 16>* clip_to_previous,
@@ -66,6 +68,7 @@ namespace vk
 				float max_motion,
 				const vk::buffer* scene_change_buffer,
 				bool generate_motion_bias,
+				bool object_motion_valid,
 				bool reset);
 		};
 

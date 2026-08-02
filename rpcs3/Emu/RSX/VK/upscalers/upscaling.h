@@ -41,6 +41,11 @@ namespace vk
 		// color patch-search estimator.
 		std::array<float, 16> camera_view_projection{};
 		bool has_camera_view_projection = false;
+		// Optional RG16F NDC coverage from the experimental object/skinned-motion
+		// pass. It is additive to the camera/color motion field and is deliberately
+		// ignored unless the caller marks it valid.
+		vk::viewable_image* object_motion = nullptr;
+		bool object_motion_valid = false;
 	};
 
 	struct upscaler

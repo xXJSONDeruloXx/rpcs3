@@ -820,6 +820,13 @@
                </widget>
               </item>
               <item>
+               <widget class="QCheckBox" name="dlssMotionObjectVelocity">
+                <property name="text">
+                 <string>Experimental Object/Skinned Motion Velocity</string>
+                </property>
+               </widget>
+              </item>
+              <item>
                <widget class="QCheckBox" name="dlssMidFrameInjection">
                 <property name="text">
                  <string>Enable Experimental Mid-Frame Injection</string>
