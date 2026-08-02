@@ -177,6 +177,9 @@ struct cfg_root : cfg::node
 		cfg::_bool disable_msl_fast_math{ this, "Disable MSL Fast Math", false };
 		cfg::_bool disable_async_host_memory_manager{ this, "Disable Asynchronous Memory Manager", false, true };
 		cfg::_enum<output_scaling_mode> output_scaling{ this, "Output Scaling Mode", output_scaling_mode::bilinear, true };
+		cfg::_enum<dlss_quality_mode> dlss_quality{ this, "DLSS Quality Mode", dlss_quality_mode::balanced, true };
+		cfg::_bool dlss_frame_generation{ this, "DLSS Frame Generation", false, true };
+		cfg::uint<1, 5> dlss_frame_generation_frames{ this, "DLSS Frame Generation Frames", 1, true };
 		cfg::_bool record_with_overlays{ this, "Record With Overlays", true, true };
 		cfg::_bool disable_hardware_texel_remapping{ this, "Disable Hardware ColorSpace Remapping", false, true };
 		cfg::uint<0, 100> rcas_sharpening_intensity{ this, "FidelityFX CAS Sharpening Intensity", 50, true };

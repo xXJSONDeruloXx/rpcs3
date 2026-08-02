@@ -776,6 +776,29 @@
                 <widget class="QComboBox" name="outputScalingMode"/>
                </item>
                <item>
+                <widget class="QComboBox" name="dlssQualityMode"/>
+               </item>
+               <item>
+                <widget class="QCheckBox" name="dlssFrameGeneration">
+                 <property name="text">
+                  <string>Enable DLSS Frame Generation</string>
+                 </property>
+                </widget>
+               </item>
+               <item>
+                <widget class="QSpinBox" name="dlssFrameGenerationFrames">
+                 <property name="minimum">
+                  <number>1</number>
+                 </property>
+                 <property name="maximum">
+                  <number>5</number>
+                 </property>
+                 <property name="prefix">
+                  <string>Generated frames: </string>
+                 </property>
+                </widget>
+               </item>
+               <item>
                 <widget class="Line" name="line">
                  <property name="orientation">
                   <enum>Qt::Orientation::Horizontal</enum>

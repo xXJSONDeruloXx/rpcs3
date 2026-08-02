@@ -5,18 +5,163 @@
 #include "Emu/RSX/Overlays/overlay_manager.h"
 #include "Emu/RSX/Overlays/overlay_debug_overlay.h"
 #include "Emu/Cell/Modules/cellVideoOut.h"
+#include "Emu/RSX/NV47/HW/context_accessors.define.h"
 
 #include "upscalers/bilinear_pass.hpp"
 #include "upscalers/fsr_pass.h"
 #include "upscalers/nearest_pass.hpp"
+#include "upscalers/temporal/temporal_pass.h"
 #include "util/asm.hpp"
 #include "util/video_provider.h"
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstring>
+#include <limits>
 
 extern atomic_t<bool> g_user_asked_for_screenshot;
 extern atomic_t<recording_mode> g_recording_mode;
 
 namespace
 {
+	using camera_matrix = std::array<float, 16>;
+
+	void load_camera_matrix(const std::array<u32[4], 512>& constants, u32 slot, camera_matrix& result)
+	{
+		for (u32 row = 0; row < 4; ++row)
+		{
+			for (u32 column = 0; column < 4; ++column)
+			{
+				float value;
+				const u32 raw = constants[slot + row][column];
+				std::memcpy(&value, &raw, sizeof(value));
+				result[row * 4 + column] = value;
+			}
+		}
+	}
+
+	bool is_orthonormal_view(const camera_matrix& matrix)
+	{
+		for (float value : matrix)
+		{
+			if (!std::isfinite(value))
+			{
+				return false;
+			}
+		}
+
+		if (std::abs(matrix[12]) > 1e-3f || std::abs(matrix[13]) > 1e-3f ||
+			std::abs(matrix[14]) > 1e-3f || std::abs(matrix[15] - 1.f) > 1e-3f)
+		{
+			return false;
+		}
+
+		for (u32 row = 0; row < 3; ++row)
+		{
+			const float length = matrix[row * 4] * matrix[row * 4] +
+				matrix[row * 4 + 1] * matrix[row * 4 + 1] +
+				matrix[row * 4 + 2] * matrix[row * 4 + 2];
+			if (std::abs(length - 1.f) > 0.02f)
+			{
+				return false;
+			}
+		}
+
+		for (u32 a = 0; a < 3; ++a)
+		{
+			for (u32 b = a + 1; b < 3; ++b)
+			{
+				const float dot = matrix[a * 4] * matrix[b * 4] +
+					matrix[a * 4 + 1] * matrix[b * 4 + 1] +
+					matrix[a * 4 + 2] * matrix[b * 4 + 2];
+				if (std::abs(dot) > 0.02f)
+				{
+					return false;
+				}
+			}
+		}
+
+		return true;
+	}
+
+	bool is_perspective_projection(const camera_matrix& matrix)
+	{
+		return matrix[0] > 0.05f && std::abs(matrix[1]) < 1e-4f && std::abs(matrix[2]) < 1e-4f && std::abs(matrix[3]) < 1e-4f &&
+			std::abs(matrix[4]) < 1e-4f && matrix[5] > 0.05f && std::abs(matrix[6]) < 1e-4f && std::abs(matrix[7]) < 1e-4f &&
+			std::abs(matrix[8]) < 1e-4f && std::abs(matrix[9]) < 1e-4f &&
+			std::abs(matrix[12]) < 1e-4f && std::abs(matrix[13]) < 1e-4f &&
+			std::abs(std::abs(matrix[14]) - 1.f) < 0.01f && std::abs(matrix[15]) < 1e-3f;
+	}
+
+	bool product_matches(const camera_matrix& projection, const camera_matrix& view, const camera_matrix& view_projection)
+	{
+		for (u32 row = 0; row < 4; ++row)
+		{
+			for (u32 column = 0; column < 4; ++column)
+			{
+				float expected = 0.f;
+				for (u32 k = 0; k < 4; ++k)
+				{
+					expected += projection[row * 4 + k] * view[k * 4 + column];
+				}
+
+				const float tolerance = std::max(0.02f, std::abs(expected) * 0.01f);
+				if (std::abs(view_projection[row * 4 + column] - expected) > tolerance)
+				{
+					return false;
+				}
+			}
+		}
+
+		return true;
+	}
+
+	bool capture_guest_camera(const rsx::context* context, float expected_aspect, camera_matrix& result)
+	{
+		if (!context)
+		{
+			return false;
+		}
+
+		const auto& constants = REGS(context)->transform_constants;
+		float best_aspect_error = std::numeric_limits<float>::max();
+		bool found = false;
+
+		for (u32 slot = 0; slot + 11 < constants.size(); ++slot)
+		{
+			camera_matrix view{};
+			camera_matrix projection{};
+			camera_matrix view_projection{};
+			load_camera_matrix(constants, slot, view);
+			load_camera_matrix(constants, slot + 4, projection);
+			load_camera_matrix(constants, slot + 8, view_projection);
+
+			if (!is_orthonormal_view(view) || !is_perspective_projection(projection) ||
+				!product_matches(projection, view, view_projection))
+			{
+				continue;
+			}
+
+			const float projection_aspect = std::abs(projection[0] / projection[5]);
+			if (!std::isfinite(projection_aspect) || projection_aspect <= 0.f)
+			{
+				continue;
+			}
+
+			const float aspect_error = std::min(std::abs(projection_aspect - expected_aspect),
+				std::abs(1.f / projection_aspect - expected_aspect));
+			if (!found || aspect_error < best_aspect_error)
+			{
+				found = true;
+				best_aspect_error = aspect_error;
+				result = view_projection;
+			}
+		}
+
+		return found;
+	}
+
 	VkFormat RSX_display_format_to_vk_format(u8 format)
 	{
 		switch (format)
@@ -78,10 +223,11 @@ bool VKGSRender::reinitialize_swapchain()
 	ensure(m_queued_frames.empty());
 
 	// Discard the current upscaling pipeline if any
+	vk::get_streamline_dlss().prepare_swapchain_recreation();
 	m_upscaler.reset();
 
 	// Drain all the queues
-	vkDeviceWaitIdle(*m_device);
+	vk::get_streamline_dlss().device_wait_idle(*m_device);
 
 	// Reset frame context storage
 	for (auto& ctx : m_frame_context_storage)
@@ -149,7 +295,14 @@ void VKGSRender::present(vk::frame_context_t *ctx)
 
 	if (!swapchain_unavailable)
 	{
-		switch (VkResult error = m_swapchain->present(ctx->present_wait_semaphore, ctx->present_image))
+		// Streamline's frame-generation plugins consume the same frame token
+		// that was used for DLSS-SR. These markers are no-ops unless the temporal
+		// pass successfully tagged depth and motion for this frame.
+		auto& streamline = vk::get_streamline_dlss();
+		streamline.before_present();
+		const VkResult present_result = m_swapchain->present(ctx->present_wait_semaphore, ctx->present_image);
+
+		switch (present_result)
 		{
 		case VK_SUCCESS:
 			break;
@@ -164,10 +317,12 @@ void VKGSRender::present(vk::frame_context_t *ctx)
 		default:
 			// Other errors not part of rpcs3. This can be caused by 3rd party injectors with bad code, of which we have no control over.
 			// Let the application attempt to recover instead of crashing outright.
-			rsx_log.error("VkPresent returned unexpected error code %lld. Will attempt to recreate the swapchain. Please disable 3rd party injector tools.", static_cast<s64>(error));
+			rsx_log.error("VkPresent returned unexpected error code %lld. Will attempt to recreate the swapchain. Please disable 3rd party injector tools.", static_cast<s64>(present_result));
 			swapchain_unavailable = true;
 			break;
 		}
+
+		streamline.after_present();
 	}
 
 	// Presentation image released; reset value
@@ -793,6 +948,10 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 		{
 			m_upscaler = std::make_unique<vk::fsr_upscale_pass>();
 		}
+		else if (m_output_scaling == output_scaling_mode::dlss)
+		{
+			m_upscaler = std::make_unique<vk::dlss_upscale_pass>();
+		}
 		else
 		{
 			m_upscaler = std::make_unique<vk::bilinear_upscale_pass>();
@@ -801,6 +960,30 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 
 	if (image_to_flip)
 	{
+		vk::temporal_frame_inputs temporal_inputs{};
+		if (m_output_scaling == output_scaling_mode::dlss)
+		{
+			temporal_inputs.present_width = static_cast<u32>(m_swapchain_dims.width);
+			temporal_inputs.present_height = static_cast<u32>(m_swapchain_dims.height);
+			temporal_inputs.present_buffer_count = m_swapchain->get_swap_image_count();
+			temporal_inputs.present_format = m_swapchain->get_surface_format();
+			temporal_inputs.has_camera_view_projection = capture_guest_camera(
+				m_ctx,
+				buffer_height ? static_cast<float>(buffer_width) / buffer_height : 1.f,
+				temporal_inputs.camera_view_projection);
+
+			// The RSX depth attachment is the one piece of guest geometry data
+			// that RPCS3 already owns as a Vulkan image. It is only paired with
+			// the present source when dimensions and sampling are compatible;
+			// otherwise the temporal pass remains color-only rather than handing
+			// DLSS a guessed depth buffer.
+			if (auto* depth = m_rtts.m_bound_depth_stencil.second;
+				depth && depth->samples() == 1 && depth->width() == image_to_flip->width() && depth->height() == image_to_flip->height())
+			{
+				temporal_inputs.depth = depth;
+			}
+		}
+
 		const bool use_full_rgb_range_output = g_cfg.video.full_rgb_range_output.get();
 
 		if (!use_full_rgb_range_output || !rsx::fcmp(avconfig.gamma, 1.f) || avconfig.stereo_enabled) [[unlikely]]
@@ -808,7 +991,7 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 			if (image_to_flip) calibration_src.push_back(image_to_flip);
 			if (image_to_flip2) calibration_src.push_back(image_to_flip2);
 
-			if (m_output_scaling == output_scaling_mode::fsr && !avconfig.stereo_enabled) // 3D will be implemented later
+			if ((m_output_scaling == output_scaling_mode::fsr || m_output_scaling == output_scaling_mode::dlss) && !avconfig.stereo_enabled) // 3D will be implemented later
 			{
 				// Run upscaling pass before the rest of the output effects pipeline
 				// This can be done with all upscalers but we already get bilinear upscaling for free if we just out the filters directly
@@ -823,7 +1006,14 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 				for (unsigned i = 0; i < calibration_src.size(); ++i)
 				{
 					const rsx::flags32_t mode = (i == 0) ? UPSCALE_LEFT_VIEW : UPSCALE_RIGHT_VIEW;
-					calibration_src[i] = m_upscaler->scale_output(*m_current_command_buffer, image_to_flip, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED, request, mode);
+					if (m_output_scaling == output_scaling_mode::dlss)
+					{
+						calibration_src[i] = m_upscaler->scale_output_temporal(*m_current_command_buffer, image_to_flip, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED, request, mode, temporal_inputs);
+					}
+					else
+					{
+						calibration_src[i] = m_upscaler->scale_output(*m_current_command_buffer, image_to_flip, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED, request, mode);
+					}
 				}
 			}
 
@@ -860,7 +1050,14 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 				target_layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
 			}
 
-			m_upscaler->scale_output(*m_current_command_buffer, image_to_flip, target_image, target_layout, rgn, UPSCALE_AND_COMMIT | UPSCALE_DEFAULT_VIEW);
+			if (m_output_scaling == output_scaling_mode::dlss)
+			{
+				m_upscaler->scale_output_temporal(*m_current_command_buffer, image_to_flip, target_image, target_layout, rgn, UPSCALE_AND_COMMIT | UPSCALE_DEFAULT_VIEW, temporal_inputs);
+			}
+			else
+			{
+				m_upscaler->scale_output(*m_current_command_buffer, image_to_flip, target_image, target_layout, rgn, UPSCALE_AND_COMMIT | UPSCALE_DEFAULT_VIEW);
+			}
 		}
 	}
 

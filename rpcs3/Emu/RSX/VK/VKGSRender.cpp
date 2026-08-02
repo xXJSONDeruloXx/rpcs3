@@ -11,6 +11,7 @@
 #include "VKHelpers.h"
 #include "VKRenderPass.h"
 #include "VKResourceManager.h"
+#include "upscalers/temporal/streamline_dlss.h"
 
 #include "vkutils/buffer_object.h"
 #include "vkutils/scratch.h"
@@ -25,6 +26,14 @@
 
 #include "util/asm.hpp"
 #include <vulkan/vulkan_core.h>
+
+namespace
+{
+	void* resolve_streamline_device_proc(VkDevice device, const char* name)
+	{
+		return vk::get_streamline_dlss().get_device_proc_addr(device, name);
+	}
+}
 
 namespace vk
 {
@@ -475,6 +484,25 @@ VKGSRender::VKGSRender(utils::serial* ar) noexcept : GSRender(ar)
 	vk::set_current_renderer(m_swapchain->get_device());
 	vk::init();
 
+	// Frame generation is the one mode that must be armed before the first
+	// swapchain is created: Streamline needs to see create/acquire/present, not
+	// merely the final image after RPCS3 has already made the chain.
+	if (g_cfg.video.output_scaling.get() == output_scaling_mode::dlss && g_cfg.video.dlss_frame_generation.get())
+	{
+		auto& streamline = vk::get_streamline_dlss();
+		if (streamline.initialize(*m_device, true) && streamline.frame_generation_available() &&
+			m_swapchain->install_streamline_proxies(&resolve_streamline_device_proc))
+		{
+			streamline.set_frame_generation_proxy_armed(true);
+			m_streamline_fg_armed = true;
+			rsx_log.notice("DLSS-FG: Streamline Vulkan swapchain proxies armed");
+		}
+		else
+		{
+			rsx_log.notice("DLSS-FG: Streamline swapchain proxies unavailable; continuing without frame generation");
+		}
+	}
+
 	m_swapchain_dims.width = m_frame->client_width();
 	m_swapchain_dims.height = m_frame->client_height();
 
@@ -803,7 +831,7 @@ VKGSRender::~VKGSRender()
 	}
 
 	//Wait for device to finish up with resources
-	vkDeviceWaitIdle(*m_device);
+	vk::get_streamline_dlss().device_wait_idle(*m_device);
 
 	// Globals. TODO: Refactor lifetime management
 	if (auto async_scheduler = g_fxo->try_get<vk::AsyncTaskScheduler>())
@@ -882,8 +910,22 @@ VKGSRender::~VKGSRender()
 	// Global resources
 	vk::destroy_global_resources();
 
-	// Device handles/contexts
-	m_swapchain->destroy();
+	// Device handles/contexts. The swapchain must be retired while the
+	// Streamline proxy is still loaded, but slShutdown must run while the
+	// Vulkan device is still alive. WSI destroy(false) releases the chain and
+	// leaves the render device for the explicit final destroy below.
+	if (vk::get_streamline_dlss().initialized())
+	{
+		vk::get_streamline_dlss().prepare_swapchain_recreation();
+		m_swapchain->destroy(false);
+		vk::get_streamline_dlss().shutdown();
+		m_streamline_fg_armed = false;
+		m_device->destroy();
+	}
+	else
+	{
+		m_swapchain->destroy();
+	}
 	m_instance.destroy();
 
 #if defined(HAVE_X11) && defined(HAVE_VULKAN)

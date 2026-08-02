@@ -38,6 +38,8 @@ namespace vk
 	class swapchain_base
 	{
 	protected:
+		using device_proc_resolver = void* (*)(VkDevice, const char*);
+
 		render_device dev;
 
 		display_handle_t window_handle{};
@@ -62,6 +64,10 @@ namespace vk
 		virtual void end_frame(command_buffer& cmd, u32 index) = 0;
 		virtual VkResult present(VkSemaphore semaphore, u32 index) = 0;
 		virtual VkImageLayout get_optimal_present_layout() const = 0;
+		virtual bool install_streamline_proxies(device_proc_resolver)
+		{
+			return false;
+		}
 
 		virtual bool supports_automatic_wm_reports() const
 		{
@@ -175,6 +181,7 @@ namespace vk
 		PFN_vkQueuePresentKHR _vkQueuePresentKHR = nullptr;
 
 		bool m_wm_reports_flag = false;
+		bool m_streamline_proxy_installed = false;
 
 	protected:
 		void init_swapchain_images(render_device& dev, u32 preferred_count = 0) override;
@@ -201,13 +208,15 @@ namespace vk
 
 		VkResult acquire_next_swapchain_image(VkSemaphore semaphore, u64 timeout, u32* result) override
 		{
-			return vkAcquireNextImageKHR(dev, m_vk_swapchain, timeout, semaphore, VK_NULL_HANDLE, result);
+			return _vkAcquireNextImageKHR(dev, m_vk_swapchain, timeout, semaphore, VK_NULL_HANDLE, result);
 		}
 
 		void end_frame(command_buffer& /*cmd*/, u32 /*index*/) override
 		{}
 
 		VkResult present(VkSemaphore semaphore, u32 image) override;
+
+		bool install_streamline_proxies(device_proc_resolver resolver) override;
 
 		VkImage get_image(u32 index) override
 		{

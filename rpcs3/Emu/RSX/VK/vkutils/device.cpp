@@ -459,8 +459,10 @@ namespace vk
 	// Render Device - The actual usable device
 	void render_device::create(vk::physical_device& pdev, u32 graphics_queue_idx, u32 present_queue_idx, u32 transfer_queue_idx)
 	{
-		float queue_priorities[1] = { 0.f };
 		pgpu = &pdev;
+		const bool streamline_frame_generation =
+			g_cfg.video.output_scaling.get() == output_scaling_mode::dlss && g_cfg.video.dlss_frame_generation.get();
+		std::vector<float> queue_priorities(pdev.get_queue_properties(graphics_queue_idx).queueCount, 0.f);
 
 		ensure(graphics_queue_idx == present_queue_idx || present_queue_idx == umax); // TODO
 		std::vector<VkDeviceQueueCreateInfo> device_queues;
@@ -471,7 +473,7 @@ namespace vk
 		graphics_queue.flags = 0;
 		graphics_queue.queueFamilyIndex = graphics_queue_idx;
 		graphics_queue.queueCount = 1;
-		graphics_queue.pQueuePriorities = queue_priorities;
+		graphics_queue.pQueuePriorities = queue_priorities.data();
 
 		u32 transfer_queue_sub_index = 0;
 		if (transfer_queue_idx == umax)
@@ -489,6 +491,17 @@ namespace vk
 			}
 		}
 
+		// Streamline's manual Vulkan path obtains its own queues beginning at the
+		// first queue not owned by the host. RPCS3 normally requests only the
+		// graphics queue and, when available, one spare transfer queue. If FG is
+		// requested, retain the rest of this family so Streamline has a valid
+		// index to create/use; the extra queues remain untouched by RPCS3.
+		m_streamline_queue_start_index = graphics_queue.queueCount;
+		if (streamline_frame_generation)
+		{
+			graphics_queue.queueCount = pdev.get_queue_properties(graphics_queue_idx).queueCount;
+		}
+
 		m_graphics_queue_family = graphics_queue_idx;
 		m_present_queue_family = present_queue_idx;
 		m_transfer_queue_family = transfer_queue_idx;
@@ -501,7 +514,7 @@ namespace vk
 			transfer_queue.flags = 0;
 			transfer_queue.queueFamilyIndex = transfer_queue_idx;
 			transfer_queue.queueCount = 1;
-			transfer_queue.pQueuePriorities = queue_priorities;
+			transfer_queue.pQueuePriorities = queue_priorities.data();
 		}
 
 		// Set up instance information

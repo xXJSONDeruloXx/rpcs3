@@ -407,6 +407,11 @@ void GLGSRender::flip(const rsx::display_flip_info_t& info)
 			case output_scaling_mode::fsr:
 				m_upscaler = std::make_unique<gl::fsr_upscale_pass>();
 				break;
+			case output_scaling_mode::dlss:
+				// DLSS is a Vulkan/Streamline path. Keep OpenGL deterministic and
+				// fall back to the existing color-only bilinear pass.
+				m_upscaler = std::make_unique<gl::bilinear_upscale_pass>();
+				break;
 			case output_scaling_mode::bilinear:
 			default:
 				m_upscaler = std::make_unique<gl::bilinear_upscale_pass>();
