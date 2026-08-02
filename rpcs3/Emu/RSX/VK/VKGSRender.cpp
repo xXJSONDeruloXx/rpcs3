@@ -417,6 +417,55 @@ u64 VKGSRender::get_cycles()
 	return thread_ctrl::get_cycles(static_cast<named_thread<VKGSRender>&>(*this));
 }
 
+void VKGSRender::clear_temporal_depth_candidate()
+{
+	if (m_temporal_depth_candidate)
+	{
+		m_temporal_depth_candidate->release();
+		m_temporal_depth_candidate = nullptr;
+	}
+}
+
+void VKGSRender::track_temporal_depth_candidate()
+{
+	auto* depth = m_rtts.m_bound_depth_stencil.second;
+	if (!depth || !depth->value || depth->samples() != 1 || depth->width() == depth->height())
+	{
+		return;
+	}
+
+	const auto depth_rank = [](VkFormat format)
+	{
+		switch (format)
+		{
+		case VK_FORMAT_D32_SFLOAT:
+		case VK_FORMAT_D32_SFLOAT_S8_UINT:
+			return 32;
+		case VK_FORMAT_D24_UNORM_S8_UINT:
+			return 24;
+		case VK_FORMAT_D16_UNORM:
+			return 16;
+		default:
+			return 0;
+		}
+	};
+
+	const u64 area = static_cast<u64>(depth->width()) * depth->height();
+	const u64 current_area = m_temporal_depth_candidate
+		? static_cast<u64>(m_temporal_depth_candidate->width()) * m_temporal_depth_candidate->height()
+		: 0;
+	const bool better_candidate = !m_temporal_depth_candidate || area > current_area ||
+		(area == current_area && depth_rank(depth->format()) > depth_rank(m_temporal_depth_candidate->format()));
+	if (!better_candidate)
+	{
+		return;
+	}
+
+	depth->add_ref();
+	clear_temporal_depth_candidate();
+	m_temporal_depth_candidate = depth;
+}
+
 VKGSRender::VKGSRender(utils::serial* ar) noexcept : GSRender(ar)
 {
 	// Initialize dependencies
@@ -887,6 +936,7 @@ VKGSRender::~VKGSRender()
 	m_frame_context_storage.clear();
 
 	// Textures
+	clear_temporal_depth_candidate();
 	m_rtts.destroy();
 	m_texture_cache.destroy();
 

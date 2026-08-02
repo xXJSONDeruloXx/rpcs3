@@ -94,6 +94,11 @@ namespace
 			std::abs(std::abs(matrix[14]) - 1.f) < 0.01f && std::abs(matrix[15]) < 1e-3f;
 	}
 
+	bool is_square_projection(const camera_matrix& matrix)
+	{
+		return matrix[5] > 0.05f && std::abs(std::abs(matrix[0] / matrix[5]) - 1.f) < 0.2f;
+	}
+
 	bool product_matches(const camera_matrix& projection, const camera_matrix& view, const camera_matrix& view_projection)
 	{
 		for (u32 row = 0; row < 4; ++row)
@@ -138,6 +143,7 @@ namespace
 			load_camera_matrix(constants, slot + 8, view_projection);
 
 			if (!is_orthonormal_view(view) || !is_perspective_projection(projection) ||
+				is_square_projection(projection) ||
 				!product_matches(projection, view, view_projection))
 			{
 				continue;
@@ -225,6 +231,7 @@ bool VKGSRender::reinitialize_swapchain()
 	// Discard the current upscaling pipeline if any
 	vk::get_streamline_dlss().prepare_swapchain_recreation();
 	m_upscaler.reset();
+	clear_temporal_depth_candidate();
 
 	// Drain all the queues
 	vk::get_streamline_dlss().device_wait_idle(*m_device);
@@ -603,6 +610,7 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 
 			if (Emu.IsStopped())
 			{
+				clear_temporal_depth_candidate();
 				m_frame->flip(m_context);
 				rsx::thread::flip(info);
 				return;
@@ -642,6 +650,7 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 
 	if (info.skip_frame || swapchain_unavailable)
 	{
+		clear_temporal_depth_candidate();
 		if (!info.skip_frame)
 		{
 			ensure(swapchain_unavailable);
@@ -973,12 +982,21 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 				temporal_inputs.camera_view_projection);
 
 			// The RSX depth attachment is the one piece of guest geometry data
-			// that RPCS3 already owns as a Vulkan image. It is only paired with
-			// the present source when dimensions and sampling are compatible;
-			// otherwise the temporal pass remains color-only rather than handing
-			// DLSS a guessed depth buffer.
-			if (auto* depth = m_rtts.m_bound_depth_stencil.second;
-				depth && depth->samples() == 1 && depth->width() == image_to_flip->width() && depth->height() == image_to_flip->height())
+			// that RPCS3 already owns as a Vulkan image. Single-sample depth is
+			// accepted even when its allocation dimensions lag the color input;
+			// the temporal pass normalizes that allocation onto the color grid.
+			// The last depth attachment at present is not necessarily the scene depth:
+			// games commonly render shadow/auxiliary passes after the main camera. The
+			// draw path keeps the largest non-square single-sample depth candidate for
+			// this present interval, with a precision tie-break, matching the Beast
+			// scene-depth pinning policy. Fall back to the current binding only when no
+			// candidate was observed.
+			auto* depth = m_temporal_depth_candidate;
+			if (!depth || !depth->value || depth->samples() != 1 || depth->width() == depth->height())
+			{
+				depth = m_rtts.m_bound_depth_stencil.second;
+			}
+			if (depth && depth->samples() == 1 && depth->width() != depth->height())
 			{
 				temporal_inputs.depth = depth;
 			}
@@ -1189,4 +1207,6 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 			flush_command_queue(true);
 		}
 	}
+
+	clear_temporal_depth_candidate();
 }

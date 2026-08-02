@@ -5,7 +5,8 @@ layout(set = 0, binding = 0) uniform sampler2D CurrentTexture;
 layout(set = 0, binding = 1) uniform sampler2D PreviousTexture;
 layout(set = 0, binding = 2) uniform sampler2D MotionTexture;
 layout(set = 0, binding = 3) uniform sampler2D DepthTexture;
-layout(set = 0, binding = 4, rgba8) uniform writeonly image2D OutputTexture;
+layout(set = 0, binding = 4) uniform sampler2D PreviousMotionTexture;
+layout(set = 0, binding = 5, rgba8) uniform writeonly image2D OutputTexture;
 
 layout(push_constant) uniform PushConstants
 {
@@ -29,12 +30,13 @@ void main()
 	vec4 motion = texture(MotionTexture, uv);
 	vec2 history_uv = clamp(uv + motion.xy / max(params.InputOutputSize.xy, vec2(1.0)), vec2(0.0001), vec2(0.9999));
 	vec4 history = texture(PreviousTexture, history_uv);
+	vec4 previous_motion = texture(PreviousMotionTexture, history_uv);
 
 	float history_weight = params.Flags.x > 0.5 ? 0.0 : clamp(motion.z, 0.0, 1.0) * 0.85;
 	if (params.Flags.y > 0.5)
 	{
 		float current_depth = texture(DepthTexture, uv).r;
-		float history_depth = texture(DepthTexture, history_uv).r;
+		float history_depth = previous_motion.a;
 		float depth_delta = abs(current_depth - history_depth);
 		// The emulator has no guaranteed depth convention, so use depth only as
 		// a disocclusion rejection signal rather than trying to linearize it.

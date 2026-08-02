@@ -10,7 +10,8 @@ R"(
 layout(set = 0, binding = 0) uniform sampler2D CurrentTexture;
 layout(set = 0, binding = 1) uniform sampler2D PreviousTexture;
 layout(set = 0, binding = 2) uniform sampler2D DepthTexture;
-layout(set = 0, binding = 3, rgba16f) uniform writeonly image2D MotionTexture;
+layout(set = 0, binding = 3, rg16f) uniform writeonly image2D MotionTexture;
+layout(set = 0, binding = 4, rgba16f) uniform writeonly image2D MotionMetadataTexture;
 
 layout(push_constant) uniform PushConstants
 {
@@ -31,6 +32,22 @@ float sample_luma(sampler2D texture_sampler, vec2 uv)
 	return luminance(texture(texture_sampler, clamp(uv, vec2(0.0001), vec2(0.9999))).rgb);
 }
 
+float patch_error(sampler2D current_texture, sampler2D previous_texture, vec2 current_uv,
+	vec2 previous_uv, vec2 texel)
+{
+	float error = 0.0;
+	for (int py = -1; py <= 1; ++py)
+	{
+		for (int px = -1; px <= 1; ++px)
+		{
+			vec2 patch_offset = vec2(px, py) * texel;
+			error += abs(sample_luma(current_texture, current_uv + patch_offset) -
+				sample_luma(previous_texture, previous_uv + patch_offset));
+		}
+	}
+	return error;
+}
+
 void main()
 {
 	ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
@@ -46,6 +63,7 @@ void main()
 	float best_error = 1e20;
 	vec2 best_offset = vec2(0.0);
 	float confidence = 0.0;
+	vec2 predicted_previous_uv = uv;
 	bool camera_motion_valid = params.Flags.z > 0.5 && params.Flags.y > 0.5;
 	if (camera_motion_valid)
 	{
@@ -64,20 +82,19 @@ void main()
 		float ndc_z = params.Flags.w > 0.5 ? depth * 2.0 - 1.0 : depth;
 		vec4 current_clip = vec4(uv * 2.0 - 1.0, ndc_z, 1.0);
 		vec4 previous_clip = vec4(
-			dot(CameraClipToPrevious[0], current_clip),
-			dot(CameraClipToPrevious[1], current_clip),
-			dot(CameraClipToPrevious[2], current_clip),
-			dot(CameraClipToPrevious[3], current_clip));
+			dot(params.CameraClipToPrevious[0], current_clip),
+			dot(params.CameraClipToPrevious[1], current_clip),
+			dot(params.CameraClipToPrevious[2], current_clip),
+			dot(params.CameraClipToPrevious[3], current_clip));
 
 		if (abs(previous_clip.w) > 1e-5)
 		{
-			vec2 previous_uv = previous_clip.xy / previous_clip.w * 0.5 + 0.5;
-			if (all(greaterThanEqual(previous_uv, vec2(0.0))) && all(lessThanEqual(previous_uv, vec2(1.0))))
+			predicted_previous_uv = previous_clip.xy / previous_clip.w * 0.5 + 0.5;
+			if (all(greaterThanEqual(predicted_previous_uv, vec2(0.0))) && all(lessThanEqual(predicted_previous_uv, vec2(1.0))))
 			{
 				// DLSS and the local resolve use render-resolution pixels pointing
 				// toward the source location in the previous frame.
-				best_offset = (previous_uv - uv) * params.InputOutputSize.xy;
-				confidence = 0.9;
+				best_offset = (predicted_previous_uv - uv) * params.InputOutputSize.xy;
 			}
 			else
 			{
@@ -87,6 +104,42 @@ void main()
 		else
 		{
 			camera_motion_valid = false;
+		}
+	}
+
+	if (camera_motion_valid)
+	{
+		// Camera reprojection is exact for static world pixels. Search a small
+		// residual around that prediction as a cheap dynamic-object path: the
+		// guest has no native velocity attachment, so an animated object must be
+		// allowed to disagree with the camera field instead of inheriting it.
+		const float camera_error = patch_error(CurrentTexture, PreviousTexture, uv, predicted_previous_uv, texel);
+		float residual_error = 1e20;
+		vec2 residual = vec2(0.0);
+		for (int oy = -2; oy <= 2; ++oy)
+		{
+			for (int ox = -2; ox <= 2; ++ox)
+			{
+				vec2 candidate = vec2(ox, oy);
+				float error = patch_error(CurrentTexture, PreviousTexture, uv,
+					predicted_previous_uv + candidate * texel, texel);
+				if (error < residual_error)
+				{
+					residual_error = error;
+					residual = candidate;
+				}
+			}
+		}
+
+		best_error = residual_error;
+		if (residual_error + 0.002 < camera_error)
+		{
+			best_offset += residual;
+			confidence = 0.25 + 0.65 * (1.0 - clamp(residual_error * 4.0, 0.0, 1.0));
+		}
+		else
+		{
+			confidence = 0.9;
 		}
 	}
 
@@ -134,6 +187,7 @@ void main()
 	}
 
 	float depth = params.Flags.y > 0.5 ? texture(DepthTexture, uv).r : 0.0;
-	imageStore(MotionTexture, pixel, vec4(best_offset, confidence, depth));
+	imageStore(MotionTexture, pixel, vec4(best_offset, 0.0, 0.0));
+	imageStore(MotionMetadataTexture, pixel, vec4(best_offset, confidence, depth));
 }
 )"

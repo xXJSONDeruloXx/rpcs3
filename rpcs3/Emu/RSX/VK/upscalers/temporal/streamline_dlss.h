@@ -54,6 +54,10 @@ namespace vk
 		void set_frame_generation_proxy_armed(bool armed) { m_frame_generation_proxy_armed = armed; }
 
 		bool set_options(u32 viewport_id, mode dlss_mode, u32 output_width, u32 output_height, bool hdr);
+		bool get_optimal_render_size(mode dlss_mode, u32 output_width, u32 output_height,
+			u32& render_width, u32& render_height);
+		bool get_render_range(mode dlss_mode, u32 output_width, u32 output_height,
+			u32& min_width, u32& min_height, u32& max_width, u32& max_height);
 		bool evaluate(VkCommandBuffer command_buffer,
 			u32 viewport_id,
 			u32 frame_index,

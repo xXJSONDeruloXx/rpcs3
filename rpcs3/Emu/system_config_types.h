@@ -355,7 +355,8 @@ enum class dlss_quality_mode
 	quality,
 	balanced,
 	performance,
-	ultra_performance
+	ultra_performance,
+	native
 };
 
 enum class stereo_render_mode_options

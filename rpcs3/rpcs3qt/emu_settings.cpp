@@ -1128,6 +1128,7 @@ QString emu_settings::GetLocalizedSetting(const QString& original, emu_settings_
 		case dlss_quality_mode::balanced: return tr("Balanced", "DLSS Quality Mode");
 		case dlss_quality_mode::performance: return tr("Performance", "DLSS Quality Mode");
 		case dlss_quality_mode::ultra_performance: return tr("Ultra Performance", "DLSS Quality Mode");
+		case dlss_quality_mode::native: return tr("Native (DLAA)", "DLSS Quality Mode");
 		}
 		break;
 	case emu_settings_type::AudioRenderer:

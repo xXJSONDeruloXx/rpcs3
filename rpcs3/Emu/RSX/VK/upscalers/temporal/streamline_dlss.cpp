@@ -422,6 +422,72 @@ namespace vk
 		return true;
 	}
 
+	bool streamline_dlss::get_optimal_render_size(mode dlss_mode, u32 output_width, u32 output_height,
+		u32& render_width, u32& render_height)
+	{
+		render_width = render_height = 0;
+
+		if (!available() || !bind_feature_functions() || !output_width || !output_height)
+		{
+			return false;
+		}
+
+		dlss_options options{};
+		options.type = make_guid(0x6ac826e4, 0x4c61, 0x4101, { 0xa9, 0x2d, 0x63, 0x8d, 0x42, 0x10, 0x57, 0xb8 });
+		options.version = 3;
+		options.mode = static_cast<u32>(dlss_mode);
+		options.output_width = output_width;
+		options.output_height = output_height;
+
+		dlss_optimal_settings settings{};
+		settings.type = make_guid(0xef1d0957, 0xfd58, 0x4df7, { 0xb5, 0x04, 0x8b, 0x69, 0xd8, 0xaa, 0x6b, 0x76 });
+		settings.version = 1;
+
+		if (m_sl_dlss_get_optimal_settings(options, settings) != 0 ||
+			!settings.optimal_render_width || !settings.optimal_render_height)
+		{
+			return false;
+		}
+
+		render_width = settings.optimal_render_width;
+		render_height = settings.optimal_render_height;
+		return true;
+	}
+
+	bool streamline_dlss::get_render_range(mode dlss_mode, u32 output_width, u32 output_height,
+		u32& min_width, u32& min_height, u32& max_width, u32& max_height)
+	{
+		min_width = min_height = max_width = max_height = 0;
+
+		if (!available() || !bind_feature_functions() || !output_width || !output_height)
+		{
+			return false;
+		}
+
+		dlss_options options{};
+		options.type = make_guid(0x6ac826e4, 0x4c61, 0x4101, { 0xa9, 0x2d, 0x63, 0x8d, 0x42, 0x10, 0x57, 0xb8 });
+		options.version = 3;
+		options.mode = static_cast<u32>(dlss_mode);
+		options.output_width = output_width;
+		options.output_height = output_height;
+
+		dlss_optimal_settings settings{};
+		settings.type = make_guid(0xef1d0957, 0xfd58, 0x4df7, { 0xb5, 0x04, 0x8b, 0x69, 0xd8, 0xaa, 0x6b, 0x76 });
+		settings.version = 1;
+
+		if (m_sl_dlss_get_optimal_settings(options, settings) != 0 ||
+			!settings.optimal_render_width || !settings.optimal_render_height)
+		{
+			return false;
+		}
+
+		min_width = settings.render_width_min;
+		min_height = settings.render_height_min;
+		max_width = settings.render_width_max;
+		max_height = settings.render_height_max;
+		return min_width && min_height && max_width && max_height;
+	}
+
 	bool streamline_dlss::bind_frame_generation_functions()
 	{
 		if (m_frame_generation_functions_bound)
@@ -490,7 +556,10 @@ namespace vk
 		}
 
 		const u32 requested_frames = std::clamp(frames_to_generate, 1u, 5u);
-		const u32 requested_backbuffers = std::max(backbuffer_count, 2u);
+		// Pass the actual swapchain count through. Streamline's DLSS-G option is
+		// describing the intercepted present chain, not asking the plugin to
+		// synthesize a minimum number of buffers.
+		const u32 requested_backbuffers = backbuffer_count;
 		const bool shape_changed =
 			m_fg_seen_color_width != color_width || m_fg_seen_color_height != color_height ||
 			m_fg_seen_motion_width != motion.width || m_fg_seen_motion_height != motion.height ||
@@ -541,7 +610,10 @@ namespace vk
 			return true;
 		}
 
-		if (!m_frame_generation_configured && m_fg_size_stable_frames < 3)
+		// Reconfiguration is deliberately conservative. The Beast integration
+		// holds dimensions for 30 complete frames after a resize before turning
+		// DLSS-G back on; the worker/present queues need time to drain and settle.
+		if (!m_frame_generation_configured && m_fg_size_stable_frames < 30)
 		{
 			++m_fg_size_stable_frames;
 			return false;

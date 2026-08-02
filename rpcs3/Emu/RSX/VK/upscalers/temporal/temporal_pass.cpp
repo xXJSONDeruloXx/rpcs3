@@ -10,12 +10,117 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 namespace vk
 {
 	namespace
 	{
 		constexpr u32 temporal_workgroup_size = 16;
+
+		bool render_size_in_range(streamline_dlss& streamline, streamline_dlss::mode mode,
+			const size2u& input_size, const size2u& output_size)
+		{
+			u32 min_width = 0, min_height = 0, max_width = 0, max_height = 0;
+			return streamline.get_render_range(mode, output_size.width, output_size.height,
+				min_width, min_height, max_width, max_height) &&
+				input_size.width >= min_width && input_size.height >= min_height &&
+				input_size.width <= max_width && input_size.height <= max_height;
+		}
+
+		// Streamline does not accept an arbitrary render size for every output/mode pair.
+		// If the emulator's resolution scale misses the driver's dynamic range, derive the
+		// smallest final-res blit that puts the input on the mode's accepted interval. This
+		// is the same safety valve used by the Beast integration and avoids repeatedly calling
+		// slEvaluateFeature with a configuration that the active DLSS model rejects.
+		bool pick_dlss_render_size(streamline_dlss& streamline, streamline_dlss::mode preferred,
+			const size2u& input_size, const size2u& requested_output,
+			streamline_dlss::mode& selected_mode, size2u& selected_output)
+		{
+			selected_mode = preferred;
+			selected_output = requested_output;
+
+			if (preferred == streamline_dlss::mode::dlaa)
+			{
+				selected_output = input_size;
+				return true;
+			}
+
+			if (input_size.width >= requested_output.width || input_size.height >= requested_output.height)
+			{
+				return false;
+			}
+
+			const std::array<streamline_dlss::mode, 5> candidates =
+			{
+				preferred,
+				streamline_dlss::mode::max_quality,
+				streamline_dlss::mode::balanced,
+				streamline_dlss::mode::max_performance,
+				streamline_dlss::mode::ultra_performance,
+			};
+
+			long best_delta = std::numeric_limits<long>::max();
+			bool found = false;
+			for (u32 candidate_index = 0; candidate_index < candidates.size(); ++candidate_index)
+			{
+				const auto candidate = candidates[candidate_index];
+				bool duplicate = false;
+				for (u32 previous_index = 0; previous_index < candidate_index; ++previous_index)
+				{
+					duplicate |= candidates[previous_index] == candidate;
+				}
+				if (duplicate)
+				{
+					// The preferred mode is also present in the fallback list. Avoid querying it twice.
+					continue;
+				}
+
+				if (render_size_in_range(streamline, candidate, input_size, requested_output))
+				{
+					selected_mode = candidate;
+					selected_output = requested_output;
+					return true;
+				}
+
+				u32 optimal_width = 0, optimal_height = 0;
+				if (!streamline.get_optimal_render_size(candidate, requested_output.width, requested_output.height,
+					optimal_width, optimal_height) || !optimal_width || !optimal_height)
+				{
+					continue;
+				}
+
+				u32 range_min_width = 0, range_min_height = 0, range_max_width = 0, range_max_height = 0;
+				const bool fixed_range = streamline.get_render_range(candidate, requested_output.width, requested_output.height,
+					range_min_width, range_min_height, range_max_width, range_max_height) &&
+					range_min_width == range_max_width && range_min_height == range_max_height;
+
+				const double bias = fixed_range ? 1.0 : 0.995;
+				const u32 candidate_width = std::max<u32>(1, static_cast<u32>(std::lround(
+					static_cast<double>(input_size.width) * requested_output.width / optimal_width * bias)));
+				const u32 candidate_height = std::max<u32>(1, static_cast<u32>(std::lround(
+					static_cast<double>(input_size.height) * requested_output.height / optimal_height * bias)));
+				const size2u candidate_output{ candidate_width, candidate_height };
+
+				if (candidate_output.width <= input_size.width || candidate_output.height <= input_size.height ||
+					!render_size_in_range(streamline, candidate, input_size, candidate_output))
+				{
+					continue;
+				}
+
+				const long delta = std::abs(static_cast<long>(candidate_width) - requested_output.width) +
+					std::abs(static_cast<long>(candidate_height) - requested_output.height);
+				if (!found || delta < best_delta)
+				{
+					found = true;
+					best_delta = delta;
+					selected_mode = candidate;
+					selected_output = candidate_output;
+				}
+			}
+
+			return found;
+		}
 
 		vk::sampler* make_temporal_sampler(std::unique_ptr<vk::sampler>& sampler)
 		{
@@ -75,6 +180,19 @@ namespace vk
 
 			vkCmdPushConstants(cmd, program->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0,
 				static_cast<u32>(constants.size() * sizeof(float)), constants.data());
+		}
+
+		bool is_hdr_color_format(VkFormat format)
+		{
+			switch (format)
+			{
+			case VK_FORMAT_R16G16B16A16_SFLOAT:
+			case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
+			case VK_FORMAT_A2R10G10B10_UNORM_PACK32:
+				return true;
+			default:
+				return false;
+			}
 		}
 
 		bool invert_matrix(const std::array<float, 16>& input, std::array<float, 16>& output)
@@ -168,6 +286,28 @@ namespace vk
 			return true;
 		}
 
+		bool camera_discontinuity(const std::array<float, 16>& current,
+			const std::array<float, 16>& previous)
+		{
+			float rotation_delta = 0.f;
+			for (const u32 index : { 0u, 1u, 2u, 4u, 5u, 6u, 8u, 9u, 10u })
+			{
+				rotation_delta = std::max(rotation_delta, std::abs(current[index] - previous[index]));
+			}
+
+			const float translation_x = current[3] - previous[3];
+			const float translation_y = current[7] - previous[7];
+			const float translation_z = current[11] - previous[11];
+			const float translation_delta = std::sqrt(
+				translation_x * translation_x + translation_y * translation_y + translation_z * translation_z);
+
+			// Ordinary camera motion should accumulate through DLSS. A near-180-degree
+			// turn or a large teleport is a different event: the previous color/depth
+			// history no longer describes the current scene. This is intentionally a
+			// high threshold; the GPU motion/confidence path handles normal pans.
+			return rotation_delta > 1.5f || translation_delta > 16.f;
+		}
+
 		void insert_temporal_write_read_barrier(const vk::command_buffer& cmd, const vk::viewable_image& image,
 			VkAccessFlags dst_access = VK_ACCESS_SHADER_READ_BIT)
 		{
@@ -185,6 +325,63 @@ namespace vk
 
 	namespace temporal
 	{
+		depth_resample_pass::depth_resample_pass()
+		{
+			m_src =
+			#include "Emu/RSX/Program/Upscalers/Temporal/depth_resample.glsl"
+			;
+
+			ssbo_count = 0;
+			use_push_constants = true;
+			push_constants_size = static_cast<u32>(m_constants.size() * sizeof(float));
+			create();
+		}
+
+		std::vector<glsl::program_input> depth_resample_pass::get_inputs()
+		{
+			std::vector<vk::glsl::program_input> inputs =
+			{
+				glsl::program_input::make(::glsl::glsl_compute_program, "InputDepth", vk::glsl::input_type_texture, 0, 0),
+				glsl::program_input::make(::glsl::glsl_compute_program, "OutputDepth", vk::glsl::input_type_storage_texture, 0, 1),
+			};
+
+			auto result = compute_task::get_inputs();
+			result.insert(result.end(), inputs.begin(), inputs.end());
+			return result;
+		}
+
+		void depth_resample_pass::bind_resources(const vk::command_buffer& /*cmd*/)
+		{
+			make_temporal_sampler(m_sampler);
+			m_program->bind_uniform({ *m_input_image, *m_sampler }, 0, 0);
+			m_program->bind_uniform({ *m_output_image }, 0, 1);
+		}
+
+		void depth_resample_pass::run(const vk::command_buffer& cmd,
+			vk::viewable_image* input,
+			vk::viewable_image* output,
+			const size2u& input_size,
+			const size2u& output_size)
+		{
+			const auto remap = rsx::default_remap_vector.with_encoding(VK_REMAP_IDENTITY);
+			m_input_image = input->get_view(remap, VK_IMAGE_ASPECT_DEPTH_BIT);
+			m_output_image = output->get_view(remap);
+
+			if (!m_program)
+			{
+				load_program(cmd);
+			}
+
+			m_constants[0] = static_cast<float>(input_size.width);
+			m_constants[1] = static_cast<float>(input_size.height);
+			m_constants[2] = static_cast<float>(output_size.width);
+			m_constants[3] = static_cast<float>(output_size.height);
+			vkCmdPushConstants(cmd, m_program->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0,
+				static_cast<u32>(m_constants.size() * sizeof(float)), m_constants.data());
+			compute_task::run(cmd, utils::aligned_div(output_size.width, temporal_workgroup_size),
+				utils::aligned_div(output_size.height, temporal_workgroup_size), 1);
+		}
+
 		motion_pass::motion_pass()
 		{
 			m_src =
@@ -205,6 +402,7 @@ namespace vk
 				glsl::program_input::make(::glsl::glsl_compute_program, "PreviousTexture", vk::glsl::input_type_texture, 0, 1),
 				glsl::program_input::make(::glsl::glsl_compute_program, "DepthTexture", vk::glsl::input_type_texture, 0, 2),
 				glsl::program_input::make(::glsl::glsl_compute_program, "MotionTexture", vk::glsl::input_type_storage_texture, 0, 3),
+				glsl::program_input::make(::glsl::glsl_compute_program, "MotionMetadataTexture", vk::glsl::input_type_storage_texture, 0, 4),
 			};
 
 			auto result = compute_task::get_inputs();
@@ -219,6 +417,7 @@ namespace vk
 			m_program->bind_uniform({ *m_previous_image, *m_sampler }, 0, 1);
 			m_program->bind_uniform({ *m_depth_image, *m_sampler }, 0, 2);
 			m_program->bind_uniform({ *m_motion_image }, 0, 3);
+			m_program->bind_uniform({ *m_motion_meta_image }, 0, 4);
 		}
 
 		void motion_pass::run(const vk::command_buffer& cmd,
@@ -226,6 +425,7 @@ namespace vk
 			vk::viewable_image* previous,
 			vk::viewable_image* depth,
 			vk::viewable_image* motion,
+			vk::viewable_image* motion_meta,
 			const size2u& input_size,
 			const size2u& output_size,
 			const std::array<float, 16>* clip_to_previous,
@@ -238,6 +438,7 @@ namespace vk
 				? depth->get_view(remap, VK_IMAGE_ASPECT_DEPTH_BIT)
 				: m_current_image;
 			m_motion_image = motion->get_view(remap);
+			m_motion_meta_image = motion_meta->get_view(remap);
 
 			if (!m_program)
 			{
@@ -245,6 +446,60 @@ namespace vk
 			}
 
 			push_motion_constants(cmd, m_program.get(), m_constants, input_size, output_size, reset, depth != nullptr, clip_to_previous);
+			compute_task::run(cmd, utils::aligned_div(input_size.width, temporal_workgroup_size),
+				utils::aligned_div(input_size.height, temporal_workgroup_size), 1);
+		}
+
+		motion_filter_pass::motion_filter_pass()
+		{
+			m_src =
+			#include "Emu/RSX/Program/Upscalers/Temporal/motion_filter.glsl"
+			;
+
+			ssbo_count = 0;
+			use_push_constants = true;
+			push_constants_size = static_cast<u32>(m_constants.size() * sizeof(float));
+			create();
+		}
+
+		std::vector<glsl::program_input> motion_filter_pass::get_inputs()
+		{
+			std::vector<vk::glsl::program_input> inputs =
+			{
+				glsl::program_input::make(::glsl::glsl_compute_program, "InputMotion", vk::glsl::input_type_texture, 0, 0),
+				glsl::program_input::make(::glsl::glsl_compute_program, "OutputMotion", vk::glsl::input_type_storage_texture, 0, 1),
+			};
+
+			auto result = compute_task::get_inputs();
+			result.insert(result.end(), inputs.begin(), inputs.end());
+			return result;
+		}
+
+		void motion_filter_pass::bind_resources(const vk::command_buffer& /*cmd*/)
+		{
+			make_temporal_sampler(m_sampler);
+			m_program->bind_uniform({ *m_input_image, *m_sampler }, 0, 0);
+			m_program->bind_uniform({ *m_output_image }, 0, 1);
+		}
+
+		void motion_filter_pass::run(const vk::command_buffer& cmd, vk::viewable_image* input,
+			vk::viewable_image* output, const size2u& input_size)
+		{
+			const auto remap = rsx::default_remap_vector.with_encoding(VK_REMAP_IDENTITY);
+			m_input_image = input->get_view(remap);
+			m_output_image = output->get_view(remap);
+
+			if (!m_program)
+			{
+				load_program(cmd);
+			}
+
+			m_constants[0] = static_cast<float>(input_size.width);
+			m_constants[1] = static_cast<float>(input_size.height);
+			m_constants[2] = 0.f;
+			m_constants[3] = 0.f;
+			vkCmdPushConstants(cmd, m_program->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0,
+				static_cast<u32>(m_constants.size() * sizeof(float)), m_constants.data());
 			compute_task::run(cmd, utils::aligned_div(input_size.width, temporal_workgroup_size),
 				utils::aligned_div(input_size.height, temporal_workgroup_size), 1);
 		}
@@ -269,7 +524,8 @@ namespace vk
 				glsl::program_input::make(::glsl::glsl_compute_program, "PreviousTexture", vk::glsl::input_type_texture, 0, 1),
 				glsl::program_input::make(::glsl::glsl_compute_program, "MotionTexture", vk::glsl::input_type_texture, 0, 2),
 				glsl::program_input::make(::glsl::glsl_compute_program, "DepthTexture", vk::glsl::input_type_texture, 0, 3),
-				glsl::program_input::make(::glsl::glsl_compute_program, "OutputTexture", vk::glsl::input_type_storage_texture, 0, 4),
+				glsl::program_input::make(::glsl::glsl_compute_program, "PreviousMotionTexture", vk::glsl::input_type_texture, 0, 4),
+				glsl::program_input::make(::glsl::glsl_compute_program, "OutputTexture", vk::glsl::input_type_storage_texture, 0, 5),
 			};
 
 			auto result = compute_task::get_inputs();
@@ -284,13 +540,15 @@ namespace vk
 			m_program->bind_uniform({ *m_previous_image, *m_sampler }, 0, 1);
 			m_program->bind_uniform({ *m_motion_image, *m_sampler }, 0, 2);
 			m_program->bind_uniform({ *m_depth_image, *m_sampler }, 0, 3);
-			m_program->bind_uniform({ *m_output_image }, 0, 4);
+			m_program->bind_uniform({ *m_previous_motion_image, *m_sampler }, 0, 4);
+			m_program->bind_uniform({ *m_output_image }, 0, 5);
 		}
 
 		void resolve_pass::run(const vk::command_buffer& cmd,
 			vk::viewable_image* current,
 			vk::viewable_image* previous,
 			vk::viewable_image* motion,
+			vk::viewable_image* previous_motion,
 			vk::viewable_image* depth,
 			vk::viewable_image* output,
 			const size2u& input_size,
@@ -301,6 +559,7 @@ namespace vk
 			m_current_image = current->get_view(remap);
 			m_previous_image = previous->get_view(remap);
 			m_motion_image = motion->get_view(remap);
+			m_previous_motion_image = previous_motion->get_view(remap);
 			m_depth_image = depth
 				? depth->get_view(remap, VK_IMAGE_ASPECT_DEPTH_BIT)
 				: m_current_image;
@@ -332,8 +591,13 @@ namespace vk
 		};
 
 		dispose(m_output);
+		dispose(m_native_output);
 		dispose(m_previous_color);
+		dispose(m_depth_resampled);
 		dispose(m_motion);
+		dispose(m_motion_meta);
+		dispose(m_motion_filtered);
+		dispose(m_previous_motion);
 		m_output_format = VK_FORMAT_UNDEFINED;
 		m_input_format = VK_FORMAT_UNDEFINED;
 		m_has_history = false;
@@ -360,6 +624,9 @@ namespace vk
 		const VkFormatFeatureFlags sampled = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
 		const VkFormatFeatureFlags output_features = VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT | sampled | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT;
 		const VkFormatFeatureFlags motion_features = VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT | sampled;
+		const VkFormatFeatureFlags motion_history_features = sampled |
+			VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+		const VkFormatFeatureFlags depth_resample_features = VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT | sampled;
 
 		if (!supports_format(*pdev, src->format(), sampled))
 		{
@@ -379,9 +646,10 @@ namespace vk
 			}
 		}
 
-		if (!supports_format(*pdev, VK_FORMAT_R16G16B16A16_SFLOAT, motion_features))
+		if (!supports_format(*pdev, VK_FORMAT_R16G16_SFLOAT, motion_features) ||
+			!supports_format(*pdev, VK_FORMAT_R16G16B16A16_SFLOAT, motion_history_features))
 		{
-			rsx_log.warning("DLSS temporal path: no storage-capable RGBA16F format for motion vectors");
+			rsx_log.warning("DLSS temporal path: no storage-capable RG16F/RGBA16F motion formats");
 			return false;
 		}
 
@@ -412,23 +680,57 @@ namespace vk
 		m_previous_color = make_image(m_input_format, src->width(), src->height(),
 			VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
 			VMM_ALLOCATION_POOL_SWAPCHAIN);
-		m_motion = make_image(VK_FORMAT_R16G16B16A16_SFLOAT, input_size.width, input_size.height,
+		if (supports_format(*pdev, VK_FORMAT_R32_SFLOAT, depth_resample_features))
+		{
+			m_depth_resampled = make_image(VK_FORMAT_R32_SFLOAT, input_size.width, input_size.height,
+				VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+				VMM_ALLOCATION_POOL_SWAPCHAIN);
+		}
+		m_motion = make_image(VK_FORMAT_R16G16_SFLOAT, input_size.width, input_size.height,
 			VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+			VMM_ALLOCATION_POOL_SWAPCHAIN);
+		m_motion_meta = make_image(VK_FORMAT_R16G16B16A16_SFLOAT, input_size.width, input_size.height,
+			VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+			VMM_ALLOCATION_POOL_SWAPCHAIN);
+		m_motion_filtered = make_image(VK_FORMAT_R16G16_SFLOAT, input_size.width, input_size.height,
+			VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+			VMM_ALLOCATION_POOL_SWAPCHAIN);
+		m_previous_motion = make_image(VK_FORMAT_R16G16B16A16_SFLOAT, input_size.width, input_size.height,
+			VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
 			VMM_ALLOCATION_POOL_SWAPCHAIN);
 		m_output = make_image(m_output_format, output_size.width, output_size.height,
 			VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
 			VMM_ALLOCATION_POOL_SWAPCHAIN);
+		if (supports_format(*pdev, m_input_format, VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+			VK_FORMAT_FEATURE_TRANSFER_SRC_BIT))
+		{
+			m_native_output = make_image(m_input_format, output_size.width, output_size.height,
+				VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+				VMM_ALLOCATION_POOL_SWAPCHAIN);
+		}
 
-		if (!m_previous_color || !m_motion || !m_output ||
-			!m_previous_color->value || !m_motion->value || !m_output->value)
+		if (!m_previous_color || !m_motion || !m_motion_meta || !m_motion_filtered || !m_previous_motion || !m_output ||
+			!m_previous_color->value || !m_motion->value || !m_motion_meta->value ||
+			!m_motion_filtered->value || !m_previous_motion->value || !m_output->value)
 		{
 			dispose_images();
 			return false;
 		}
 
 		m_previous_color->set_debug_name("DLSS temporal previous color");
+		if (m_depth_resampled)
+		{
+			m_depth_resampled->set_debug_name("DLSS temporal normalized depth");
+		}
 		m_motion->set_debug_name("DLSS temporal motion vectors");
+		m_motion_meta->set_debug_name("DLSS temporal motion metadata");
+		m_motion_filtered->set_debug_name("DLSS temporal filtered motion vectors");
+		m_previous_motion->set_debug_name("DLSS temporal previous motion vectors");
 		m_output->set_debug_name("DLSS temporal output");
+		if (m_native_output)
+		{
+			m_native_output->set_debug_name("DLSS native output");
+		}
 		return true;
 	}
 
@@ -445,6 +747,22 @@ namespace vk
 
 		m_previous_color->change_layout(cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 		src->pop_layout(cmd);
+	}
+
+	void dlss_upscale_pass::copy_motion_to_history(const vk::command_buffer& cmd)
+	{
+		m_motion_meta->change_layout(cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+		m_previous_motion->change_layout(cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+
+		VkImageCopy region{};
+		region.srcSubresource = { m_motion_meta->aspect(), 0, 0, 1 };
+		region.dstSubresource = { m_previous_motion->aspect(), 0, 0, 1 };
+		region.extent = { m_motion_meta->width(), m_motion_meta->height(), 1 };
+		vkCmdCopyImage(cmd, m_motion_meta->value, m_motion_meta->current_layout,
+			m_previous_motion->value, m_previous_motion->current_layout, 1, &region);
+
+		m_previous_motion->change_layout(cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+		m_motion_meta->change_layout(cmd, VK_IMAGE_LAYOUT_GENERAL);
 	}
 
 	vk::viewable_image* dlss_upscale_pass::scale_output(
@@ -497,12 +815,43 @@ namespace vk
 			return src;
 		}
 
-		if (!m_output || m_input_format != src->format() || m_previous_color->width() != src->width() ||
-			m_previous_color->height() != src->height() || m_motion->width() != input_size.width ||
-			m_motion->height() != input_size.height || m_output->width() != output_size.width ||
-			m_output->height() != output_size.height)
+		auto& streamline = get_streamline_dlss();
+		if (!m_streamline_attempted)
 		{
-			if (!initialize_images(src, input_size, output_size))
+			m_streamline_attempted = true;
+			streamline.initialize(*vk::get_current_renderer(), g_cfg.video.dlss_frame_generation.get());
+		}
+
+		streamline_dlss::mode requested_dlss_mode = streamline_dlss::mode::balanced;
+		switch (g_cfg.video.dlss_quality.get())
+		{
+		case dlss_quality_mode::quality: requested_dlss_mode = streamline_dlss::mode::max_quality; break;
+		case dlss_quality_mode::balanced: requested_dlss_mode = streamline_dlss::mode::balanced; break;
+		case dlss_quality_mode::performance: requested_dlss_mode = streamline_dlss::mode::max_performance; break;
+		case dlss_quality_mode::ultra_performance: requested_dlss_mode = streamline_dlss::mode::ultra_performance; break;
+		case dlss_quality_mode::native: requested_dlss_mode = streamline_dlss::mode::dlaa; break;
+		}
+
+		const size2u requested_output_size = output_size;
+		size2u dlss_output_size = output_size;
+		streamline_dlss::mode selected_dlss_mode = requested_dlss_mode;
+		bool native_configuration_valid = false;
+		if (streamline.available() && inputs.depth && inputs.depth->value && inputs.depth->samples() == 1)
+		{
+			native_configuration_valid = pick_dlss_render_size(streamline, requested_dlss_mode,
+				input_size, requested_output_size, selected_dlss_mode, dlss_output_size);
+		}
+
+		if (!m_output || !m_previous_color || !m_motion || !m_motion_meta || !m_motion_filtered || !m_previous_motion || m_input_format != src->format() ||
+			m_previous_color->width() != src->width() ||
+			m_previous_color->height() != src->height() || m_motion->width() != input_size.width ||
+			m_motion_meta->width() != input_size.width || m_motion_filtered->width() != input_size.width ||
+			m_motion->height() != input_size.height || m_motion_meta->height() != input_size.height ||
+			m_motion_filtered->height() != input_size.height ||
+			m_output->width() != dlss_output_size.width ||
+			m_output->height() != dlss_output_size.height)
+		{
+			if (!initialize_images(src, input_size, dlss_output_size))
 			{
 				if (mode & UPSCALE_AND_COMMIT)
 				{
@@ -517,21 +866,58 @@ namespace vk
 			}
 		}
 
-		const bool reset = inputs.reset_history || !m_has_history;
+		const bool native_output_available = m_native_output && m_native_output->value;
+		native_configuration_valid &= native_output_available;
+
+		const bool camera_cut = m_has_history && inputs.has_camera_view_projection &&
+			m_has_previous_camera_view_projection && camera_discontinuity(
+				inputs.camera_view_projection, m_previous_camera_view_projection);
+		const bool reset = inputs.reset_history || !m_has_history || camera_cut;
 		if (reset)
 		{
 			copy_current_to_history(cmd, src, input_size);
 		}
 
-		const bool has_depth = inputs.depth && inputs.depth->value && inputs.depth->samples() == 1;
-		if (has_depth)
+		const bool source_depth_available = inputs.depth && inputs.depth->value && inputs.depth->samples() == 1;
+		const bool depth_needs_resample = source_depth_available &&
+			(inputs.depth->width() != input_size.width || inputs.depth->height() != input_size.height);
+		vk::viewable_image* depth_for_temporal = source_depth_available ? inputs.depth : nullptr;
+		bool source_depth_pushed = false;
+
+		if (depth_needs_resample && m_depth_resampled && m_depth_resampled->value)
 		{
 			if (auto* depth_target = dynamic_cast<vk::render_target*>(inputs.depth))
 			{
 				depth_target->read_barrier(const_cast<vk::command_buffer&>(cmd));
 			}
 			inputs.depth->push_layout(cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+			source_depth_pushed = true;
+
+			m_depth_resampled->change_layout(cmd, VK_IMAGE_LAYOUT_GENERAL);
+			vk::get_compute_task<vk::temporal::depth_resample_pass>()->run(cmd, inputs.depth,
+				m_depth_resampled.get(), { inputs.depth->width(), inputs.depth->height() }, input_size);
+			insert_temporal_write_read_barrier(cmd, *m_depth_resampled);
+			m_depth_resampled->change_layout(cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+			inputs.depth->pop_layout(cmd);
+			source_depth_pushed = false;
+			depth_for_temporal = m_depth_resampled.get();
 		}
+		else if (source_depth_available && !depth_needs_resample)
+		{
+			if (auto* depth_target = dynamic_cast<vk::render_target*>(inputs.depth))
+			{
+				depth_target->read_barrier(const_cast<vk::command_buffer&>(cmd));
+			}
+			inputs.depth->push_layout(cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+			source_depth_pushed = true;
+		}
+		else
+		{
+			depth_for_temporal = nullptr;
+		}
+
+		const bool has_depth = depth_for_temporal && depth_for_temporal->value;
+		native_configuration_valid &= has_depth;
 
 		src->push_layout(cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 		m_previous_color->push_layout(cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
@@ -540,8 +926,17 @@ namespace vk
 		{
 			insert_temporal_write_read_barrier(cmd, *m_motion, VK_ACCESS_SHADER_WRITE_BIT);
 		}
+		if (m_motion_meta->current_layout == VK_IMAGE_LAYOUT_GENERAL)
+		{
+			insert_temporal_write_read_barrier(cmd, *m_motion_meta, VK_ACCESS_SHADER_WRITE_BIT);
+		}
 		m_motion->change_layout(cmd, VK_IMAGE_LAYOUT_GENERAL);
+		m_motion_meta->change_layout(cmd, VK_IMAGE_LAYOUT_GENERAL);
 		m_output->change_layout(cmd, VK_IMAGE_LAYOUT_GENERAL);
+		if (native_configuration_valid)
+		{
+			m_native_output->change_layout(cmd, VK_IMAGE_LAYOUT_GENERAL);
+		}
 
 		std::array<float, 16> clip_to_previous{};
 		const bool has_camera_pair = has_depth && !reset && inputs.has_camera_view_projection &&
@@ -549,35 +944,48 @@ namespace vk
 				inputs.camera_view_projection, m_previous_camera_view_projection, clip_to_previous);
 
 		vk::get_compute_task<vk::temporal::motion_pass>()->run(cmd, src, m_previous_color.get(),
-			has_depth ? inputs.depth : nullptr, m_motion.get(), input_size, output_size,
+			has_depth ? depth_for_temporal : nullptr, m_motion.get(), m_motion_meta.get(), input_size, dlss_output_size,
 			has_camera_pair ? &clip_to_previous : nullptr, reset);
 		insert_temporal_write_read_barrier(cmd, *m_motion);
+		insert_temporal_write_read_barrier(cmd, *m_motion_meta);
+		m_motion->change_layout(cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+		m_motion_filtered->change_layout(cmd, VK_IMAGE_LAYOUT_GENERAL);
+		vk::get_compute_task<vk::temporal::motion_filter_pass>()->run(cmd, m_motion.get(), m_motion_filtered.get(), input_size);
+		insert_temporal_write_read_barrier(cmd, *m_motion_filtered);
+		m_motion_filtered->change_layout(cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+		if (reset)
+		{
+			// Prime the previous-depth channel before the first resolve. History is
+			// disabled on this frame, but the resource must still be initialized and
+			// transitioned for the following frame's disocclusion test.
+			copy_motion_to_history(cmd);
+		}
 
 		if (inputs.has_camera_view_projection)
 		{
 			m_previous_camera_view_projection = inputs.camera_view_projection;
 			m_has_previous_camera_view_projection = true;
 		}
-
-		if (!m_streamline_attempted)
+		else
 		{
-			m_streamline_attempted = true;
-			get_streamline_dlss().initialize(*vk::get_current_renderer(), g_cfg.video.dlss_frame_generation.get());
+			// Do not carry a camera pair across a frame where capture failed. A
+			// stale matrix would turn the next valid depth sample into a fabricated
+			// camera vector.
+			m_has_previous_camera_view_projection = false;
 		}
 
 		bool native_dlss_evaluated = false;
-		auto& streamline = get_streamline_dlss();
 		if (!g_cfg.video.dlss_frame_generation.get() && streamline.frame_generation_proxy_armed())
 		{
 			streamline.prepare_swapchain_recreation();
 		}
-		if (has_depth && streamline.available())
+		if (has_depth && streamline.available() && native_configuration_valid)
 		{
 			const auto remap = rsx::default_remap_vector.with_encoding(VK_REMAP_IDENTITY);
 			const auto* input_view = src->get_view(remap);
-			const auto* output_view = m_output->get_view(remap);
-			const auto* depth_view = inputs.depth->get_view(remap, VK_IMAGE_ASPECT_DEPTH_BIT);
-			const auto* motion_view = m_motion->get_view(remap);
+			const auto* output_view = m_native_output->get_view(remap);
+			const auto* depth_view = depth_for_temporal->get_view(remap, VK_IMAGE_ASPECT_DEPTH_BIT);
+			const auto* motion_view = m_motion_filtered->get_view(remap);
 
 			streamline_dlss::texture input_texture
 			{
@@ -585,28 +993,22 @@ namespace vk
 			};
 			streamline_dlss::texture output_texture
 			{
-				m_output->value, output_view->value, m_output->format(), m_output->current_layout, m_output->width(), m_output->height()
+				m_native_output->value, output_view->value, m_native_output->format(), m_native_output->current_layout,
+				m_native_output->width(), m_native_output->height()
 			};
 			streamline_dlss::texture depth_texture
 			{
-				inputs.depth->value, depth_view->value, inputs.depth->format(), inputs.depth->current_layout,
-				inputs.depth->width(), inputs.depth->height()
+				depth_for_temporal->value, depth_view->value, depth_for_temporal->format(), depth_for_temporal->current_layout,
+				depth_for_temporal->width(), depth_for_temporal->height()
 			};
 			streamline_dlss::texture motion_texture
 			{
-				m_motion->value, motion_view->value, m_motion->format(), m_motion->current_layout, m_motion->width(), m_motion->height()
+				m_motion_filtered->value, motion_view->value, m_motion_filtered->format(), m_motion_filtered->current_layout,
+				m_motion_filtered->width(), m_motion_filtered->height()
 			};
 
-			streamline_dlss::mode dlss_mode = streamline_dlss::mode::balanced;
-			switch (g_cfg.video.dlss_quality.get())
-			{
-			case dlss_quality_mode::quality: dlss_mode = streamline_dlss::mode::max_quality; break;
-			case dlss_quality_mode::balanced: dlss_mode = streamline_dlss::mode::balanced; break;
-			case dlss_quality_mode::performance: dlss_mode = streamline_dlss::mode::max_performance; break;
-			case dlss_quality_mode::ultra_performance: dlss_mode = streamline_dlss::mode::ultra_performance; break;
-			}
-
-			if (streamline.set_options(0, dlss_mode, output_size.width, output_size.height, false))
+			if (streamline.set_options(0, selected_dlss_mode, dlss_output_size.width, dlss_output_size.height,
+				is_hdr_color_format(src->format())))
 			{
 				native_dlss_evaluated = streamline.evaluate(cmd, 0, static_cast<u32>(vk::get_current_frame_id()), reset,
 					inputs.jitter_x, inputs.jitter_y, input_texture, output_texture, depth_texture, motion_texture);
@@ -614,9 +1016,9 @@ namespace vk
 				if (native_dlss_evaluated && g_cfg.video.dlss_frame_generation.get() &&
 					streamline.frame_generation_available() && streamline.frame_generation_proxy_armed())
 				{
-					const u32 color_width = inputs.present_width ? inputs.present_width : output_size.width;
-					const u32 color_height = inputs.present_height ? inputs.present_height : output_size.height;
-					const VkFormat color_format = inputs.present_format != VK_FORMAT_UNDEFINED ? inputs.present_format : m_output->format();
+					const u32 color_width = inputs.present_width ? inputs.present_width : requested_output_size.width;
+					const u32 color_height = inputs.present_height ? inputs.present_height : requested_output_size.height;
+					const VkFormat color_format = inputs.present_format != VK_FORMAT_UNDEFINED ? inputs.present_format : m_native_output->format();
 					const u32 backbuffer_count = inputs.present_buffer_count ? inputs.present_buffer_count : 2;
 
 					if (streamline.configure_frame_generation(0, color_width, color_height, color_format, backbuffer_count,
@@ -631,16 +1033,18 @@ namespace vk
 
 		if (!native_dlss_evaluated)
 		{
-			vk::get_compute_task<vk::temporal::resolve_pass>()->run(cmd, src, m_previous_color.get(), m_motion.get(),
-				has_depth ? inputs.depth : nullptr, m_output.get(), input_size, output_size, reset);
+			vk::get_compute_task<vk::temporal::resolve_pass>()->run(cmd, src, m_previous_color.get(), m_motion_meta.get(), m_previous_motion.get(),
+				has_depth ? depth_for_temporal : nullptr, m_output.get(), input_size, dlss_output_size, reset);
 		}
-		// Both the local resolve and Streamline's native evaluator write the same
-		// output image. Make that write visible before the present blit or the
-		// caller's shader-read transition; this also keeps the native path from
-		// relying on an implementation-specific Streamline barrier.
-		insert_temporal_write_read_barrier(cmd, *m_output);
+		// Both the local resolve and Streamline's native evaluator write an image.
+		// Make the selected write visible before the present blit or the caller's
+		// shader-read transition; this keeps the native path from relying on an
+		// implementation-specific Streamline barrier.
+		vk::viewable_image* final_output = native_dlss_evaluated ? m_native_output.get() : m_output.get();
+		insert_temporal_write_read_barrier(cmd, *final_output);
+		copy_motion_to_history(cmd);
 
-		if (has_depth)
+		if (source_depth_pushed)
 		{
 			inputs.depth->pop_layout(cmd);
 		}
@@ -653,12 +1057,12 @@ namespace vk
 		if (mode & UPSCALE_AND_COMMIT)
 		{
 			ensure(present_surface);
-			m_output->change_layout(cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+			final_output->change_layout(cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
 
 			VkImageBlit output_request = request;
-			output_request.srcSubresource = { m_output->aspect(), 0, 0, 1 };
+			output_request.srcSubresource = { final_output->aspect(), 0, 0, 1 };
 			output_request.srcOffsets[0] = { 0, 0, 0 };
-			output_request.srcOffsets[1] = { static_cast<s32>(output_size.width), static_cast<s32>(output_size.height), 1 };
+			output_request.srcOffsets[1] = { static_cast<s32>(dlss_output_size.width), static_cast<s32>(dlss_output_size.height), 1 };
 			if (request.srcOffsets[0].x > request.srcOffsets[1].x)
 			{
 				std::swap(output_request.srcOffsets[0].x, output_request.srcOffsets[1].x);
@@ -668,12 +1072,12 @@ namespace vk
 				std::swap(output_request.srcOffsets[0].y, output_request.srcOffsets[1].y);
 			}
 
-			vkCmdBlitImage(cmd, m_output->value, m_output->current_layout,
+			vkCmdBlitImage(cmd, final_output->value, final_output->current_layout,
 				present_surface, present_surface_layout, 1, &output_request, VK_FILTER_LINEAR);
 			return nullptr;
 		}
 
-		m_output->change_layout(cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-		return m_output.get();
+		final_output->change_layout(cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+		return final_output;
 	}
 }

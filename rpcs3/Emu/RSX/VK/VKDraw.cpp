@@ -1363,6 +1363,7 @@ void VKGSRender::end()
 	}
 
 	m_rtts.on_write(m_framebuffer_layout.color_write_enabled, m_framebuffer_layout.zeta_write_enabled);
+	track_temporal_depth_candidate();
 
 	rsx::thread::end();
 }

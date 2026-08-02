@@ -114,6 +114,7 @@ private:
 
 	std::unique_ptr<vk::buffer> m_host_object_data;
 	vk::framebuffer_holder* m_draw_fbo = nullptr;
+	vk::render_target* m_temporal_depth_candidate = nullptr;
 
 	sizeu m_swapchain_dims{};
 	bool swapchain_unavailable = false;
@@ -239,6 +240,8 @@ private:
 
 	void update_draw_state();
 	void check_present_status();
+	void track_temporal_depth_candidate();
+	void clear_temporal_depth_candidate();
 
 	vk::vertex_upload_info upload_vertex_data();
 	rsx::simple_array<u8> m_scratch_mem;

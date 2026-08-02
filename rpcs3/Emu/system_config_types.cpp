@@ -716,6 +716,7 @@ void fmt_class_string<dlss_quality_mode>::format(std::string& out, u64 arg)
 		case dlss_quality_mode::balanced: return "Balanced";
 		case dlss_quality_mode::performance: return "Performance";
 		case dlss_quality_mode::ultra_performance: return "Ultra Performance";
+		case dlss_quality_mode::native: return "Native (DLAA)";
 		}
 
 		return unknown;
