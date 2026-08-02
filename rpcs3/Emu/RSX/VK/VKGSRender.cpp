@@ -12,6 +12,7 @@
 #include "VKRenderPass.h"
 #include "VKResourceManager.h"
 #include "upscalers/temporal/camera_capture.h"
+#include "upscalers/temporal/temporal_pass.h"
 #include "upscalers/temporal/streamline_dlss.h"
 
 #include "vkutils/buffer_object.h"
@@ -955,6 +956,7 @@ VKGSRender::~VKGSRender()
 
 	// Upscaler (references some global resources)
 	m_upscaler.reset();
+	m_midframe_upscaler.reset();
 
 	// Heaps
 	vk::data_heap_manager::reset();

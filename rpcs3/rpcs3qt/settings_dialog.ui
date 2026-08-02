@@ -786,14 +786,48 @@
                 </widget>
                </item>
                <item>
-                <widget class="QCheckBox" name="dlssMotionBias">
-                 <property name="text">
-                  <string>Use DLSS Motion Bias Mask</string>
-                 </property>
-                </widget>
-               </item>
-               <item>
-                <widget class="QCheckBox" name="dlssFrameGeneration">
+               <widget class="QCheckBox" name="dlssMotionBias">
+                <property name="text">
+                 <string>Use DLSS Motion Bias Mask</string>
+                </property>
+               </widget>
+              </item>
+              <item>
+               <widget class="QCheckBox" name="dlssMotionDynamicMask">
+                <property name="text">
+                 <string>Mask Dynamic/Disoccluded Motion</string>
+                </property>
+               </widget>
+              </item>
+              <item>
+               <widget class="QCheckBox" name="dlssMotionFarRotation">
+                <property name="text">
+                 <string>Use Far-Depth Camera Rotation</string>
+                </property>
+               </widget>
+              </item>
+              <item>
+               <widget class="QSpinBox" name="dlssMotionEdgeMode">
+                <property name="minimum">
+                 <number>0</number>
+                </property>
+                <property name="maximum">
+                 <number>2</number>
+                </property>
+                <property name="prefix">
+                 <string>Motion edge policy: </string>
+                </property>
+               </widget>
+              </item>
+              <item>
+               <widget class="QCheckBox" name="dlssMidFrameInjection">
+                <property name="text">
+                 <string>Enable Experimental Mid-Frame Injection</string>
+                </property>
+               </widget>
+              </item>
+              <item>
+               <widget class="QCheckBox" name="dlssFrameGeneration">
                  <property name="text">
                   <string>Enable DLSS Frame Generation</string>
                  </property>

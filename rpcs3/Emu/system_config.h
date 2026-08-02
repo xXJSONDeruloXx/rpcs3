@@ -180,6 +180,10 @@ struct cfg_root : cfg::node
 		cfg::_enum<dlss_quality_mode> dlss_quality{ this, "DLSS Quality Mode", dlss_quality_mode::balanced, true };
 		cfg::_bool dlss_jitter{ this, "DLSS Rendering Jitter", false, true };
 		cfg::_bool dlss_motion_bias{ this, "DLSS Motion Bias Mask", false, true };
+		cfg::_bool dlss_motion_dynamic_mask{ this, "DLSS Dynamic Motion Mask", false, true };
+		cfg::_bool dlss_motion_far_rotation{ this, "DLSS Far-Depth Rotation", false, true };
+		cfg::uint<0, 2> dlss_motion_edge_mode{ this, "DLSS Motion Edge Mode", 0, true };
+		cfg::_bool dlss_mid_frame_injection{ this, "DLSS Mid-Frame Injection", false, true };
 		cfg::_bool dlss_frame_generation{ this, "DLSS Frame Generation", false, true };
 		cfg::_bool dlss_frame_generation_raw_motion{ this, "DLSS Frame Generation Raw Motion", false, true };
 		cfg::uint<1, 5> dlss_frame_generation_frames{ this, "DLSS Frame Generation Frames", 1, true };

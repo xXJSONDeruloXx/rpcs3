@@ -158,9 +158,10 @@ namespace vk
 		}
 
 		void push_motion_constants(const vk::command_buffer& cmd, vk::glsl::program* program,
-			std::array<float, 28>& constants, const size2u& input_size, const size2u& output_size,
+			std::array<float, 32>& constants, const size2u& input_size, const size2u& output_size,
 			bool reset, bool has_depth, const std::array<float, 16>* clip_to_previous,
-			float jitter_delta_x, float jitter_delta_y, bool generate_motion_bias)
+			float jitter_delta_x, float jitter_delta_y, bool generate_motion_bias,
+			bool dynamic_mask, bool far_rotation, u32 edge_mode, float max_motion)
 		{
 			constants[0] = static_cast<float>(input_size.width);
 			constants[1] = static_cast<float>(input_size.height);
@@ -174,6 +175,10 @@ namespace vk
 			constants[9] = jitter_delta_y;
 			constants[10] = generate_motion_bias ? 1.f : 0.f;
 			constants[11] = 0.f;
+			constants[28] = dynamic_mask ? 1.f : 0.f;
+			constants[29] = far_rotation ? 1.f : 0.f;
+			constants[30] = static_cast<float>(std::min<u32>(edge_mode, 2));
+			constants[31] = std::max(32.f, max_motion);
 
 			if (clip_to_previous)
 			{
@@ -181,7 +186,7 @@ namespace vk
 			}
 			else
 			{
-				std::fill(constants.begin() + 12, constants.end(), 0.f);
+				std::fill(constants.begin() + 12, constants.begin() + 28, 0.f);
 			}
 
 			vkCmdPushConstants(cmd, program->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0,
@@ -448,6 +453,10 @@ namespace vk
 			const std::array<float, 16>* clip_to_previous,
 			float jitter_delta_x,
 			float jitter_delta_y,
+			bool dynamic_mask,
+			bool far_rotation,
+			u32 edge_mode,
+			float max_motion,
 			const vk::buffer* scene_change_buffer,
 			bool generate_motion_bias,
 			bool reset)
@@ -456,7 +465,7 @@ namespace vk
 			m_current_image = current->get_view(remap);
 			m_previous_image = previous->get_view(remap);
 			m_depth_image = depth
-				? depth->get_view(remap, VK_IMAGE_ASPECT_DEPTH_BIT)
+				? depth->get_view(remap, (depth->aspect() & VK_IMAGE_ASPECT_DEPTH_BIT) ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT)
 				: m_current_image;
 			m_motion_image = motion->get_view(remap);
 			m_motion_meta_image = motion_meta->get_view(remap);
@@ -474,7 +483,8 @@ namespace vk
 				VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_HOST_WRITE_BIT,
 				VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
 			push_motion_constants(cmd, m_program.get(), m_constants, input_size, output_size, reset, depth != nullptr,
-				clip_to_previous, jitter_delta_x, jitter_delta_y, generate_motion_bias);
+				clip_to_previous, jitter_delta_x, jitter_delta_y, generate_motion_bias,
+				dynamic_mask, far_rotation, edge_mode, max_motion);
 			compute_task::run(cmd, utils::aligned_div(input_size.width, temporal_workgroup_size),
 				utils::aligned_div(input_size.height, temporal_workgroup_size), 1);
 			insert_buffer_memory_barrier(cmd, m_scene_change_buffer->value, 0,
@@ -626,6 +636,7 @@ namespace vk
 		dispose(m_native_output);
 		dispose(m_previous_color);
 		dispose(m_depth_resampled);
+		dispose(m_dummy_depth);
 		dispose(m_motion);
 		dispose(m_motion_meta);
 		dispose(m_motion_filtered);
@@ -643,6 +654,11 @@ namespace vk
 		m_scene_was_changing = false;
 		m_scene_motion_meter_warm = false;
 		m_scene_frames_since_reset = 0;
+		m_last_native_evaluated = false;
+		m_midframe_source = VK_NULL_HANDLE;
+		m_midframe_destination = VK_NULL_HANDLE;
+		m_midframe_frame = 0;
+		m_midframe_native_history_valid = false;
 	}
 
 	bool dlss_upscale_pass::read_scene_change_counters(const size2u& input_size, u32& changed, u32& motion)
@@ -750,6 +766,7 @@ namespace vk
 		const VkFormatFeatureFlags motion_history_features = sampled |
 			VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
 		const VkFormatFeatureFlags depth_resample_features = VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT | sampled;
+		const VkFormatFeatureFlags dummy_depth_features = sampled | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
 
 		if (!supports_format(*pdev, src->format(), sampled))
 		{
@@ -783,7 +800,8 @@ namespace vk
 			return false;
 		}
 
-		auto make_image = [pdev](VkFormat format, u32 width, u32 height, VkImageUsageFlags usage, vmm_allocation_pool pool)
+		auto make_image = [pdev](VkFormat format, u32 width, u32 height, VkImageUsageFlags usage,
+			vmm_allocation_pool pool, rsx::format_class format_class = RSX_FORMAT_CLASS_COLOR)
 		{
 			return std::make_unique<vk::viewable_image>(
 				*pdev,
@@ -797,7 +815,7 @@ namespace vk
 				usage,
 				VK_IMAGE_CREATE_ALLOW_NULL_RPCS3,
 				pool,
-				RSX_FORMAT_CLASS_COLOR);
+				format_class);
 		};
 
 		m_input_format = src->format();
@@ -809,6 +827,12 @@ namespace vk
 			m_depth_resampled = make_image(VK_FORMAT_R32_SFLOAT, input_size.width, input_size.height,
 				VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
 				VMM_ALLOCATION_POOL_SWAPCHAIN);
+		}
+		if (supports_format(*pdev, VK_FORMAT_D32_SFLOAT, dummy_depth_features))
+		{
+			m_dummy_depth = make_image(VK_FORMAT_D32_SFLOAT, input_size.width, input_size.height,
+				VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+				VMM_ALLOCATION_POOL_SWAPCHAIN, RSX_FORMAT_CLASS_DEPTH16_FLOAT);
 		}
 		m_motion = make_image(VK_FORMAT_R16G16_SFLOAT, input_size.width, input_size.height,
 			VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
@@ -848,6 +872,10 @@ namespace vk
 		if (m_depth_resampled)
 		{
 			m_depth_resampled->set_debug_name("DLSS temporal normalized depth");
+		}
+		if (m_dummy_depth)
+		{
+			m_dummy_depth->set_debug_name("DLSS temporal dummy depth");
 		}
 		m_motion->set_debug_name("DLSS temporal motion vectors");
 		m_motion_meta->set_debug_name("DLSS temporal motion metadata");
@@ -918,6 +946,8 @@ namespace vk
 			return nullptr;
 		}
 
+		m_last_native_evaluated = false;
+
 		const size2u input_size
 		{
 			static_cast<u32>(std::abs(request.srcOffsets[1].x - request.srcOffsets[0].x)),
@@ -964,7 +994,8 @@ namespace vk
 		size2u dlss_output_size = output_size;
 		streamline_dlss::mode selected_dlss_mode = requested_dlss_mode;
 		bool native_configuration_valid = false;
-		if (streamline.available() && inputs.depth && inputs.depth->value && inputs.depth->samples() == 1)
+		if (streamline.available() &&
+			((inputs.depth && inputs.depth->value && inputs.depth->samples() == 1) || inputs.allow_dummy_depth))
 		{
 			native_configuration_valid = pick_dlss_render_size(streamline, requested_dlss_mode,
 				input_size, requested_output_size, selected_dlss_mode, dlss_output_size);
@@ -1072,7 +1103,24 @@ namespace vk
 		}
 		else
 		{
-			depth_for_temporal = nullptr;
+			if (!source_depth_available && inputs.allow_dummy_depth && m_dummy_depth && m_dummy_depth->value &&
+				m_dummy_depth->width() == input_size.width && m_dummy_depth->height() == input_size.height)
+			{
+				if (m_dummy_depth->current_layout == VK_IMAGE_LAYOUT_UNDEFINED)
+				{
+					m_dummy_depth->change_layout(cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+					VkClearDepthStencilValue clear{ 1.f, 0 };
+					const VkImageSubresourceRange range{ VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1 };
+					vkCmdClearDepthStencilImage(cmd, m_dummy_depth->value, m_dummy_depth->current_layout,
+						&clear, 1, &range);
+					m_dummy_depth->change_layout(cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+				}
+				depth_for_temporal = m_dummy_depth.get();
+			}
+			else
+			{
+				depth_for_temporal = nullptr;
+			}
 		}
 
 		const bool has_depth = depth_for_temporal && depth_for_temporal->value;
@@ -1124,6 +1172,8 @@ namespace vk
 			has_depth ? depth_for_temporal : nullptr, m_motion.get(), m_motion_meta.get(), m_previous_motion.get(), m_motion_bias.get(),
 			input_size, dlss_output_size,
 			has_camera_pair ? &clip_to_previous : nullptr, jitter_delta_x, jitter_delta_y,
+			g_cfg.video.dlss_motion_dynamic_mask.get(), g_cfg.video.dlss_motion_far_rotation.get(),
+			g_cfg.video.dlss_motion_edge_mode.get(), has_camera_pair ? 128.f : 32.f,
 			prepare_scene_change_buffer(input_size), g_cfg.video.dlss_motion_bias.get(), reset);
 		insert_temporal_write_read_barrier(cmd, *m_motion);
 		insert_temporal_write_read_barrier(cmd, *m_motion_meta);
@@ -1168,7 +1218,8 @@ namespace vk
 			const auto remap = rsx::default_remap_vector.with_encoding(VK_REMAP_IDENTITY);
 			const auto* input_view = src->get_view(remap);
 			const auto* output_view = m_native_output->get_view(remap);
-			const auto* depth_view = depth_for_temporal->get_view(remap, VK_IMAGE_ASPECT_DEPTH_BIT);
+			const auto* depth_view = depth_for_temporal->get_view(remap,
+				(depth_for_temporal->aspect() & VK_IMAGE_ASPECT_DEPTH_BIT) ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT);
 			const auto* motion_view = m_motion_filtered->get_view(remap);
 			const auto* bias_view = m_motion_bias->get_view(remap);
 			const bool use_raw_frame_generation_motion = g_cfg.video.dlss_frame_generation_raw_motion.get();
@@ -1205,14 +1256,15 @@ namespace vk
 				frame_generation_motion->current_layout, frame_generation_motion->width(), frame_generation_motion->height()
 			};
 
-			if (streamline.set_options(0, selected_dlss_mode, dlss_output_size.width, dlss_output_size.height,
+			if (streamline.set_options(inputs.viewport_id, selected_dlss_mode, dlss_output_size.width, dlss_output_size.height,
 				is_hdr_color_format(src->format())))
 			{
-				native_dlss_evaluated = streamline.evaluate(cmd, 0, static_cast<u32>(vk::get_current_frame_id()), reset,
+				native_dlss_evaluated = streamline.evaluate(cmd, inputs.viewport_id, static_cast<u32>(vk::get_current_frame_id()), reset,
 					inputs.jitter_x, inputs.jitter_y, input_texture, output_texture, depth_texture, motion_texture,
 					g_cfg.video.dlss_motion_bias.get() ? &bias_texture : nullptr);
 
-				if (native_dlss_evaluated && g_cfg.video.dlss_frame_generation.get() &&
+				if (native_dlss_evaluated && inputs.allow_frame_generation && inputs.viewport_id == 0 &&
+					g_cfg.video.dlss_frame_generation.get() &&
 					streamline.frame_generation_available() && streamline.frame_generation_proxy_armed())
 				{
 					const u32 color_width = inputs.present_width ? inputs.present_width : requested_output_size.width;
@@ -1229,6 +1281,7 @@ namespace vk
 				}
 			}
 		}
+		m_last_native_evaluated = native_dlss_evaluated;
 
 		if (!native_dlss_evaluated)
 		{
@@ -1278,5 +1331,53 @@ namespace vk
 
 		final_output->change_layout(cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 		return final_output;
+	}
+
+	bool dlss_upscale_pass::run_mid_frame(
+		const vk::command_buffer& cmd,
+		vk::viewable_image* src,
+		vk::viewable_image* dst,
+		vk::viewable_image* depth,
+		const temporal_frame_inputs& inputs)
+	{
+		m_last_native_evaluated = false;
+
+		if (!src || !dst || src == dst || src->samples() != 1 || dst->samples() != 1 ||
+			!src->value || !dst->value || src->width() >= dst->width() || src->height() >= dst->height())
+		{
+			return false;
+		}
+
+		const size2u input_size{ src->width(), src->height() };
+		const size2u output_size{ dst->width(), dst->height() };
+		VkImageBlit request{};
+		request.srcSubresource = { src->aspect(), 0, 0, 1 };
+		request.dstSubresource = { dst->aspect(), 0, 0, 1 };
+		request.srcOffsets[1] = { static_cast<s32>(input_size.width), static_cast<s32>(input_size.height), 1 };
+		request.dstOffsets[1] = { static_cast<s32>(output_size.width), static_cast<s32>(output_size.height), 1 };
+
+		temporal_frame_inputs midframe_inputs = inputs;
+		midframe_inputs.depth = depth;
+		midframe_inputs.viewport_id = 1;
+		midframe_inputs.allow_frame_generation = false;
+		midframe_inputs.allow_dummy_depth = true;
+		midframe_inputs.present_width = 0;
+		midframe_inputs.present_height = 0;
+		midframe_inputs.present_buffer_count = 0;
+		midframe_inputs.present_format = VK_FORMAT_UNDEFINED;
+		const u64 frame_id = vk::get_current_frame_id();
+		const bool resource_changed = m_midframe_source != src->value || m_midframe_destination != dst->value;
+		const bool frame_gap = m_midframe_frame && frame_id > m_midframe_frame + 8;
+		midframe_inputs.reset_history |= resource_changed || frame_gap || !m_midframe_native_history_valid;
+
+		dst->change_layout(cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+		scale_output_temporal(cmd, src, dst->value, dst->current_layout, request,
+			UPSCALE_AND_COMMIT | UPSCALE_DEFAULT_VIEW, midframe_inputs);
+		dst->change_layout(cmd, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+		m_midframe_source = src->value;
+		m_midframe_destination = dst->value;
+		m_midframe_frame = frame_id;
+		m_midframe_native_history_valid = m_last_native_evaluated;
+		return m_last_native_evaluated;
 	}
 }

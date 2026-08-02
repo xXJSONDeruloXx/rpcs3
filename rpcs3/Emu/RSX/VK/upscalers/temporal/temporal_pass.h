@@ -41,7 +41,7 @@ namespace vk
 			const vk::image_view* m_previous_motion_image = nullptr;
 			const vk::image_view* m_motion_bias_image = nullptr;
 			const vk::buffer* m_scene_change_buffer = nullptr;
-			std::array<float, 28> m_constants{};
+			std::array<float, 32> m_constants{};
 
 			motion_pass();
 
@@ -60,6 +60,10 @@ namespace vk
 				const std::array<float, 16>* clip_to_previous,
 				float jitter_delta_x,
 				float jitter_delta_y,
+				bool dynamic_mask,
+				bool far_rotation,
+				u32 edge_mode,
+				float max_motion,
 				const vk::buffer* scene_change_buffer,
 				bool generate_motion_bias,
 				bool reset);
@@ -118,6 +122,7 @@ namespace vk
 		std::unique_ptr<vk::viewable_image> m_output;
 		std::unique_ptr<vk::viewable_image> m_previous_color;
 		std::unique_ptr<vk::viewable_image> m_depth_resampled;
+		std::unique_ptr<vk::viewable_image> m_dummy_depth;
 		std::unique_ptr<vk::viewable_image> m_motion;
 		std::unique_ptr<vk::viewable_image> m_motion_meta;
 		std::unique_ptr<vk::viewable_image> m_motion_filtered;
@@ -133,6 +138,11 @@ namespace vk
 		float m_previous_jitter_y = 0.f;
 		bool m_has_previous_jitter = false;
 		bool m_streamline_attempted = false;
+		bool m_last_native_evaluated = false;
+		VkImage m_midframe_source = VK_NULL_HANDLE;
+		VkImage m_midframe_destination = VK_NULL_HANDLE;
+		u64 m_midframe_frame = 0;
+		bool m_midframe_native_history_valid = false;
 
 		static constexpr u32 scene_change_counter_count = 9;
 		struct scene_change_buffer_slot
@@ -176,6 +186,17 @@ namespace vk
 			rsx::flags32_t mode,
 			const temporal_frame_inputs& inputs
 		) override;
+
+		// Beast's optional mid-frame hook has a separate history/viewport from
+		// the final present path. The caller supplies the real destination RT;
+		// this method returns true only when a native Streamline evaluation wrote
+		// it and the guest fullscreen draw can be skipped.
+		bool run_mid_frame(
+			const vk::command_buffer& cmd,
+			vk::viewable_image* src,
+			vk::viewable_image* dst,
+			vk::viewable_image* depth,
+			const temporal_frame_inputs& inputs);
 
 		vk::viewable_image* motion_image() const { return m_motion_filtered.get(); }
 		vk::viewable_image* output_image() const { return m_output.get(); }

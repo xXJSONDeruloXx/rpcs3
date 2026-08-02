@@ -30,7 +30,10 @@ namespace vk
 		u32 present_height = 0;
 		u32 present_buffer_count = 0;
 		VkFormat present_format = VK_FORMAT_UNDEFINED;
+		u32 viewport_id = 0;
 		bool reset_history = false;
+		bool allow_frame_generation = true;
+		bool allow_dummy_depth = false;
 		float jitter_x = 0.f;
 		float jitter_y = 0.f;
 		// Optional structural camera capture. When present, the temporal pass

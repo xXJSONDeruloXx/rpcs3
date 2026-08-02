@@ -33,6 +33,7 @@ using fs_binding_table_t = decltype(VKFragmentProgram::binding_table);
 namespace vk
 {
 	using host_data_t = rsx::host_gpu_context_t;
+	class dlss_upscale_pass;
 }
 
 class VKGSRender : public GSRender, public ::rsx::reports::ZCULL_control
@@ -67,6 +68,7 @@ private:
 	std::unique_ptr<vk::buffer_view> null_buffer_view;
 
 	std::unique_ptr<vk::upscaler> m_upscaler;
+	std::unique_ptr<vk::dlss_upscale_pass> m_midframe_upscaler;
 	output_scaling_mode m_output_scaling{output_scaling_mode::bilinear};
 
 	std::unique_ptr<vk::buffer> m_cond_render_buffer;
@@ -261,6 +263,7 @@ private:
 	void load_texture_env();
 	bool bind_texture_env();
 	bool bind_interpreter_texture_env();
+	bool try_midframe_dlss_injection(const vk::vertex_upload_info& upload_info);
 
 public:
 	void init_buffers(rsx::framebuffer_creation_context context, bool skip_reading = false);
