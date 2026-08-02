@@ -38,7 +38,10 @@ namespace vk
 			const vk::image_view* m_depth_image = nullptr;
 			const vk::image_view* m_motion_image = nullptr;
 			const vk::image_view* m_motion_meta_image = nullptr;
-			std::array<float, 24> m_constants{};
+			const vk::image_view* m_previous_motion_image = nullptr;
+			const vk::image_view* m_motion_bias_image = nullptr;
+			const vk::buffer* m_scene_change_buffer = nullptr;
+			std::array<float, 28> m_constants{};
 
 			motion_pass();
 
@@ -50,9 +53,15 @@ namespace vk
 				vk::viewable_image* depth,
 				vk::viewable_image* motion,
 				vk::viewable_image* motion_meta,
+				vk::viewable_image* previous_motion,
+				vk::viewable_image* motion_bias,
 				const size2u& input_size,
 				const size2u& output_size,
 				const std::array<float, 16>* clip_to_previous,
+				float jitter_delta_x,
+				float jitter_delta_y,
+				const vk::buffer* scene_change_buffer,
+				bool generate_motion_bias,
 				bool reset);
 		};
 
@@ -112,6 +121,7 @@ namespace vk
 		std::unique_ptr<vk::viewable_image> m_motion;
 		std::unique_ptr<vk::viewable_image> m_motion_meta;
 		std::unique_ptr<vk::viewable_image> m_motion_filtered;
+		std::unique_ptr<vk::viewable_image> m_motion_bias;
 		std::unique_ptr<vk::viewable_image> m_previous_motion;
 		std::unique_ptr<vk::viewable_image> m_native_output;
 		VkFormat m_output_format = VK_FORMAT_UNDEFINED;
@@ -119,9 +129,29 @@ namespace vk
 		bool m_has_history = false;
 		std::array<float, 16> m_previous_camera_view_projection{};
 		bool m_has_previous_camera_view_projection = false;
+		float m_previous_jitter_x = 0.f;
+		float m_previous_jitter_y = 0.f;
+		bool m_has_previous_jitter = false;
 		bool m_streamline_attempted = false;
 
+		static constexpr u32 scene_change_counter_count = 9;
+		struct scene_change_buffer_slot
+		{
+			std::unique_ptr<vk::buffer> buffer;
+			u64 frame_tag = 0;
+			u32 width = 0;
+			u32 height = 0;
+			bool consumed = true;
+		};
+		std::vector<scene_change_buffer_slot> m_scene_change_buffers;
+		vk::buffer* m_active_scene_change_buffer = nullptr;
+		bool m_scene_was_changing = false;
+		bool m_scene_motion_meter_warm = false;
+		u32 m_scene_frames_since_reset = 0;
+
 		void dispose_images();
+		bool read_scene_change_counters(const size2u& input_size, u32& changed, u32& motion);
+		vk::buffer* prepare_scene_change_buffer(const size2u& input_size);
 		bool initialize_images(const vk::viewable_image* src, const size2u& input_size, const size2u& output_size);
 		void copy_current_to_history(const vk::command_buffer& cmd, vk::viewable_image* src, const size2u& input_size);
 		void copy_motion_to_history(const vk::command_buffer& cmd);

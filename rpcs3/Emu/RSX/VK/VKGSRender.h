@@ -120,6 +120,12 @@ private:
 	bool swapchain_unavailable = false;
 	bool should_reinitialize_swapchain = false;
 	bool m_streamline_fg_armed = false;
+	float m_temporal_jitter_x = 0.f;
+	float m_temporal_jitter_y = 0.f;
+	u32 m_temporal_jitter_render_width = 0;
+	u32 m_temporal_jitter_render_height = 0;
+	u32 m_temporal_jitter_index = 1;
+	bool m_temporal_jitter_enabled = false;
 
 	u64 m_last_heap_sync_time = 0;
 	u32 m_texbuffer_view_size = 0;
@@ -242,6 +248,7 @@ private:
 	void check_present_status();
 	void track_temporal_depth_candidate();
 	void clear_temporal_depth_candidate();
+	void advance_temporal_jitter(u32 render_width, u32 render_height);
 
 	vk::vertex_upload_info upload_vertex_data();
 	rsx::simple_array<u8> m_scratch_mem;

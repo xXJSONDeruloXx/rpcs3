@@ -11,6 +11,7 @@
 #include "VKHelpers.h"
 #include "VKRenderPass.h"
 #include "VKResourceManager.h"
+#include "upscalers/temporal/camera_capture.h"
 #include "upscalers/temporal/streamline_dlss.h"
 
 #include "vkutils/buffer_object.h"
@@ -32,6 +33,19 @@ namespace
 	void* resolve_streamline_device_proc(VkDevice device, const char* name)
 	{
 		return vk::get_streamline_dlss().get_device_proc_addr(device, name);
+	}
+
+	float halton(u32 index, u32 base)
+	{
+		float result = 0.f;
+		float fraction = 1.f;
+		while (index)
+		{
+			fraction /= static_cast<float>(base);
+			result += fraction * static_cast<float>(index % base);
+			index /= base;
+		}
+		return result;
 	}
 }
 
@@ -464,6 +478,35 @@ void VKGSRender::track_temporal_depth_candidate()
 	depth->add_ref();
 	clear_temporal_depth_candidate();
 	m_temporal_depth_candidate = depth;
+}
+
+void VKGSRender::advance_temporal_jitter(u32 render_width, u32 render_height)
+{
+	const bool enabled = g_cfg.video.output_scaling.get() == output_scaling_mode::dlss &&
+		g_cfg.video.dlss_jitter.get() && render_width && render_height;
+
+	if (!enabled)
+	{
+		m_temporal_jitter_enabled = false;
+		m_temporal_jitter_x = 0.f;
+		m_temporal_jitter_y = 0.f;
+		m_temporal_jitter_render_width = 0;
+		m_temporal_jitter_render_height = 0;
+		m_graphics_state |= rsx::pipeline_state::vertex_state_dirty;
+		return;
+	}
+
+	m_temporal_jitter_enabled = true;
+	m_temporal_jitter_render_width = render_width;
+	m_temporal_jitter_render_height = render_height;
+	m_temporal_jitter_x = (halton(m_temporal_jitter_index, 2) - 0.5f);
+	m_temporal_jitter_y = (halton(m_temporal_jitter_index, 3) - 0.5f);
+	m_temporal_jitter_index = m_temporal_jitter_index % 16 + 1;
+
+	// The jitter is stored in the vertex environment. Force the next guest draw
+	// to allocate a fresh environment block even when the RSX did not change its
+	// normal vertex state between presents.
+	m_graphics_state |= rsx::pipeline_state::vertex_state_dirty;
 }
 
 VKGSRender::VKGSRender(utils::serial* ar) noexcept : GSRender(ar)
@@ -2062,7 +2105,10 @@ void VKGSRender::load_program_env()
 
 	const bool update_transform_constants = !!(m_graphics_state & rsx::pipeline_state::transform_constants_dirty);
 	const bool update_fragment_constants = !!(m_graphics_state & rsx::pipeline_state::fragment_constants_dirty);
-	const bool update_vertex_env = !!(m_graphics_state & rsx::pipeline_state::vertex_state_dirty);
+	const bool temporal_jitter = m_temporal_jitter_enabled &&
+		g_cfg.video.output_scaling.get() == output_scaling_mode::dlss &&
+		g_cfg.video.dlss_jitter.get();
+	const bool update_vertex_env = temporal_jitter || !!(m_graphics_state & rsx::pipeline_state::vertex_state_dirty);
 	const bool update_fragment_env = !!(m_graphics_state & rsx::pipeline_state::fragment_state_dirty);
 	const bool update_fragment_texture_env = !!(m_graphics_state & rsx::pipeline_state::fragment_texture_state_dirty);
 	const bool update_instruction_buffers = (!!m_interpreter_state && is_interpreter);
@@ -2082,6 +2128,26 @@ void VKGSRender::load_program_env()
 		*(reinterpret_cast<f32*>(buf + 72)) = ctx->point_size() * resolution_scaling_config.scale_factor();
 		*(reinterpret_cast<f32*>(buf + 76)) = ctx->clip_min();
 		*(reinterpret_cast<f32*>(buf + 80)) = ctx->clip_max();
+
+		float jitter_ndc_x = 0.f;
+		float jitter_ndc_y = 0.f;
+		if (temporal_jitter && m_framebuffer_layout.zeta_write_enabled &&
+			m_framebuffer_layout.width && m_framebuffer_layout.height &&
+			m_temporal_jitter_render_width && m_temporal_jitter_render_height)
+		{
+			const float expected_aspect = static_cast<float>(m_framebuffer_layout.width) /
+				static_cast<float>(m_framebuffer_layout.height);
+			if (vk::temporal_camera::has_camera_constants(ctx->transform_constants, expected_aspect))
+			{
+				// The vertex decompiler adds this in clip space, scaled by w. The
+				// values are in the render image's pixel convention used by DLSS.
+				jitter_ndc_x = 2.f * m_temporal_jitter_x / m_temporal_jitter_render_width;
+				jitter_ndc_y = 2.f * m_temporal_jitter_y / m_temporal_jitter_render_height;
+			}
+		}
+		*(reinterpret_cast<f32*>(buf + 84)) = jitter_ndc_x;
+		*(reinterpret_cast<f32*>(buf + 88)) = jitter_ndc_y;
+		*(reinterpret_cast<f32*>(buf + 92)) = (jitter_ndc_x != 0.f || jitter_ndc_y != 0.f) ? 1.f : 0.f;
 
 		m_vertex_env_ring_info.unmap();
 		m_vertex_env_dynamic_offset = mem;

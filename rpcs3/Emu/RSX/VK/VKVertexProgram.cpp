@@ -472,6 +472,9 @@ void VKVertexDecompilerThread::insertMainEnd(std::stringstream& OS)
 	}
 
 	OS << "	gl_Position = gl_Position * scale_offset_mat;\n";
+	OS << "	if (get_vertex_context().reserved[2] > 0.5) {\n";
+	OS << "		gl_Position.xy += vec2(get_vertex_context().reserved[0], get_vertex_context().reserved[1]) * gl_Position.w;\n";
+	OS << "	}\n";
 	OS << "	gl_Position = apply_zclip_xform(gl_Position, z_near, z_far);\n";
 	OS << "}\n";
 }

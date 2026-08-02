@@ -816,7 +816,8 @@ namespace vk
 		const texture& input,
 		const texture& output,
 		const texture& depth,
-		const texture& motion)
+		const texture& motion,
+		const texture* bias)
 	{
 		if (!available() || input.format == VK_FORMAT_UNDEFINED || output.format == VK_FORMAT_UNDEFINED ||
 			depth.format == VK_FORMAT_UNDEFINED || motion.format == VK_FORMAT_UNDEFINED)
@@ -842,13 +843,26 @@ namespace vk
 		resource output_resource = make_resource(output);
 		resource depth_resource = make_resource(depth);
 		resource motion_resource = make_resource(motion);
+		const bool use_bias = bias && bias->image && bias->view && bias->width && bias->height &&
+			bias->format != VK_FORMAT_UNDEFINED;
+		resource bias_resource{};
+		if (use_bias)
+		{
+			bias_resource = make_resource(*bias);
+		}
 		resource_tag input_tag = make_tag(&input_resource, 3, input.width, input.height);   // ScalingInputColor
 		resource_tag output_tag = make_tag(&output_resource, 4, output.width, output.height); // ScalingOutputColor
 		resource_tag depth_tag = make_tag(&depth_resource, 0, depth.width, depth.height);   // Depth
 		resource_tag motion_tag = make_tag(&motion_resource, 1, motion.width, motion.height); // MotionVectors
+		resource_tag bias_tag{};
+		if (use_bias)
+		{
+			bias_tag = make_tag(&bias_resource, 29, bias->width, bias->height);
+		}
 
-		void* inputs[] = { const_cast<viewport_handle*>(&viewport), &depth_tag, &motion_tag, &input_tag, &output_tag };
-		const bool evaluated = m_sl_evaluate_feature(0, frame_token, inputs, static_cast<u32>(std::size(inputs)), command_buffer) == 0;
+		void* inputs[] = { const_cast<viewport_handle*>(&viewport), &depth_tag, &motion_tag, &input_tag, &output_tag, &bias_tag };
+		const u32 input_count = use_bias ? 6 : 5;
+		const bool evaluated = m_sl_evaluate_feature(0, frame_token, inputs, input_count, command_buffer) == 0;
 		m_last_frame_token = evaluated ? frame_token : nullptr;
 		return evaluated;
 	}

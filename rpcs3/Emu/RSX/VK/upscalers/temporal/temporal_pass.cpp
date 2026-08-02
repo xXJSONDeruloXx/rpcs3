@@ -17,6 +17,7 @@ namespace vk
 	namespace
 	{
 		constexpr u32 temporal_workgroup_size = 16;
+		constexpr u32 scene_change_counter_count = 9;
 
 		bool render_size_in_range(streamline_dlss& streamline, streamline_dlss::mode mode,
 			const size2u& input_size, const size2u& output_size)
@@ -157,8 +158,9 @@ namespace vk
 		}
 
 		void push_motion_constants(const vk::command_buffer& cmd, vk::glsl::program* program,
-			std::array<float, 24>& constants, const size2u& input_size, const size2u& output_size,
-			bool reset, bool has_depth, const std::array<float, 16>* clip_to_previous)
+			std::array<float, 28>& constants, const size2u& input_size, const size2u& output_size,
+			bool reset, bool has_depth, const std::array<float, 16>* clip_to_previous,
+			float jitter_delta_x, float jitter_delta_y, bool generate_motion_bias)
 		{
 			constants[0] = static_cast<float>(input_size.width);
 			constants[1] = static_cast<float>(input_size.height);
@@ -168,14 +170,18 @@ namespace vk
 			constants[5] = has_depth ? 1.f : 0.f;
 			constants[6] = clip_to_previous ? 1.f : 0.f;
 			constants[7] = 0.f; // RPCS3's Vulkan depth attachment is in [0, 1].
+			constants[8] = jitter_delta_x;
+			constants[9] = jitter_delta_y;
+			constants[10] = generate_motion_bias ? 1.f : 0.f;
+			constants[11] = 0.f;
 
 			if (clip_to_previous)
 			{
-				std::copy(clip_to_previous->begin(), clip_to_previous->end(), constants.begin() + 8);
+				std::copy(clip_to_previous->begin(), clip_to_previous->end(), constants.begin() + 12);
 			}
 			else
 			{
-				std::fill(constants.begin() + 8, constants.end(), 0.f);
+				std::fill(constants.begin() + 12, constants.end(), 0.f);
 			}
 
 			vkCmdPushConstants(cmd, program->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0,
@@ -407,6 +413,12 @@ namespace vk
 
 			auto result = compute_task::get_inputs();
 			result.insert(result.end(), inputs.begin(), inputs.end());
+			result.push_back(glsl::program_input::make(::glsl::glsl_compute_program,
+				"SceneChange", vk::glsl::input_type_storage_buffer, 0, 5));
+			result.push_back(glsl::program_input::make(::glsl::glsl_compute_program,
+				"PreviousMotionMetadata", vk::glsl::input_type_texture, 0, 6));
+			result.push_back(glsl::program_input::make(::glsl::glsl_compute_program,
+				"BiasTexture", vk::glsl::input_type_storage_texture, 0, 7));
 			return result;
 		}
 
@@ -418,6 +430,9 @@ namespace vk
 			m_program->bind_uniform({ *m_depth_image, *m_sampler }, 0, 2);
 			m_program->bind_uniform({ *m_motion_image }, 0, 3);
 			m_program->bind_uniform({ *m_motion_meta_image }, 0, 4);
+			m_program->bind_uniform({ *m_scene_change_buffer, 0, scene_change_counter_count * sizeof(u32) }, 0, 5);
+			m_program->bind_uniform({ *m_previous_motion_image, *m_sampler }, 0, 6);
+			m_program->bind_uniform({ *m_motion_bias_image }, 0, 7);
 		}
 
 		void motion_pass::run(const vk::command_buffer& cmd,
@@ -426,9 +441,15 @@ namespace vk
 			vk::viewable_image* depth,
 			vk::viewable_image* motion,
 			vk::viewable_image* motion_meta,
+			vk::viewable_image* previous_motion,
+			vk::viewable_image* motion_bias,
 			const size2u& input_size,
 			const size2u& output_size,
 			const std::array<float, 16>* clip_to_previous,
+			float jitter_delta_x,
+			float jitter_delta_y,
+			const vk::buffer* scene_change_buffer,
+			bool generate_motion_bias,
 			bool reset)
 		{
 			const auto remap = rsx::default_remap_vector.with_encoding(VK_REMAP_IDENTITY);
@@ -439,15 +460,26 @@ namespace vk
 				: m_current_image;
 			m_motion_image = motion->get_view(remap);
 			m_motion_meta_image = motion_meta->get_view(remap);
+			m_previous_motion_image = previous_motion->get_view(remap);
+			m_motion_bias_image = motion_bias->get_view(remap);
+			m_scene_change_buffer = scene_change_buffer;
 
 			if (!m_program)
 			{
 				load_program(cmd);
 			}
 
-			push_motion_constants(cmd, m_program.get(), m_constants, input_size, output_size, reset, depth != nullptr, clip_to_previous);
+			insert_buffer_memory_barrier(cmd, m_scene_change_buffer->value, 0,
+				scene_change_counter_count * sizeof(u32), VK_PIPELINE_STAGE_HOST_BIT,
+				VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_HOST_WRITE_BIT,
+				VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+			push_motion_constants(cmd, m_program.get(), m_constants, input_size, output_size, reset, depth != nullptr,
+				clip_to_previous, jitter_delta_x, jitter_delta_y, generate_motion_bias);
 			compute_task::run(cmd, utils::aligned_div(input_size.width, temporal_workgroup_size),
 				utils::aligned_div(input_size.height, temporal_workgroup_size), 1);
+			insert_buffer_memory_barrier(cmd, m_scene_change_buffer->value, 0,
+				scene_change_counter_count * sizeof(u32), VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
 		}
 
 		motion_filter_pass::motion_filter_pass()
@@ -597,12 +629,102 @@ namespace vk
 		dispose(m_motion);
 		dispose(m_motion_meta);
 		dispose(m_motion_filtered);
+		dispose(m_motion_bias);
 		dispose(m_previous_motion);
 		m_output_format = VK_FORMAT_UNDEFINED;
 		m_input_format = VK_FORMAT_UNDEFINED;
 		m_has_history = false;
 		m_previous_camera_view_projection = {};
 		m_has_previous_camera_view_projection = false;
+		m_previous_jitter_x = 0.f;
+		m_previous_jitter_y = 0.f;
+		m_has_previous_jitter = false;
+		m_active_scene_change_buffer = nullptr;
+		m_scene_was_changing = false;
+		m_scene_motion_meter_warm = false;
+		m_scene_frames_since_reset = 0;
+	}
+
+	bool dlss_upscale_pass::read_scene_change_counters(const size2u& input_size, u32& changed, u32& motion)
+	{
+		const u64 completed_frame = vk::get_last_completed_frame_id();
+		scene_change_buffer_slot* newest = nullptr;
+
+		for (auto& slot : m_scene_change_buffers)
+		{
+			if (!slot.buffer || slot.consumed || !slot.frame_tag || slot.frame_tag > completed_frame)
+			{
+				continue;
+			}
+
+			if (slot.width == input_size.width && slot.height == input_size.height &&
+				(!newest || slot.frame_tag > newest->frame_tag))
+			{
+				newest = &slot;
+			}
+		}
+
+		// Only the newest completed result is useful. Mark older completed slots
+		// consumed too, so a delayed present cannot replay stale cut evidence.
+		for (auto& slot : m_scene_change_buffers)
+		{
+			if (slot.buffer && slot.frame_tag && slot.frame_tag <= completed_frame)
+			{
+				slot.consumed = true;
+			}
+		}
+
+		if (!newest)
+		{
+			return false;
+		}
+
+		const auto values = static_cast<const u32*>(newest->buffer->map(0, scene_change_counter_count * sizeof(u32)));
+		changed = values[0];
+		motion = values[1];
+		newest->buffer->unmap();
+		return true;
+	}
+
+	vk::buffer* dlss_upscale_pass::prepare_scene_change_buffer(const size2u& input_size)
+	{
+		const u64 completed_frame = vk::get_last_completed_frame_id();
+		scene_change_buffer_slot* slot = nullptr;
+
+		for (auto& candidate : m_scene_change_buffers)
+		{
+			if (!candidate.buffer || !candidate.frame_tag || candidate.frame_tag <= completed_frame)
+			{
+				slot = &candidate;
+				break;
+			}
+		}
+
+		if (!slot)
+		{
+			m_scene_change_buffers.emplace_back();
+			slot = &m_scene_change_buffers.back();
+		}
+
+		if (!slot->buffer)
+		{
+			const auto* device = vk::get_current_renderer();
+			const auto& memory = device->get_memory_mapping();
+			slot->buffer = std::make_unique<vk::buffer>(*device,
+				scene_change_counter_count * sizeof(u32), memory.host_visible_coherent,
+				VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+				VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, 0, VMM_ALLOCATION_POOL_SYSTEM);
+		}
+
+		auto* values = static_cast<u32*>(slot->buffer->map(0, scene_change_counter_count * sizeof(u32)));
+		std::fill_n(values, scene_change_counter_count, 0u);
+		slot->buffer->unmap();
+		slot->frame_tag = vk::get_current_frame_id() + 1;
+		slot->width = input_size.width;
+		slot->height = input_size.height;
+		slot->consumed = false;
+		m_active_scene_change_buffer = slot->buffer.get();
+		return m_active_scene_change_buffer;
 	}
 
 	bool dlss_upscale_pass::supports_format(const vk::render_device& device, VkFormat format, VkFormatFeatureFlags features)
@@ -624,6 +746,7 @@ namespace vk
 		const VkFormatFeatureFlags sampled = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
 		const VkFormatFeatureFlags output_features = VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT | sampled | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT;
 		const VkFormatFeatureFlags motion_features = VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT | sampled;
+		const VkFormatFeatureFlags motion_bias_features = VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT | sampled;
 		const VkFormatFeatureFlags motion_history_features = sampled |
 			VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
 		const VkFormatFeatureFlags depth_resample_features = VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT | sampled;
@@ -647,9 +770,10 @@ namespace vk
 		}
 
 		if (!supports_format(*pdev, VK_FORMAT_R16G16_SFLOAT, motion_features) ||
-			!supports_format(*pdev, VK_FORMAT_R16G16B16A16_SFLOAT, motion_history_features))
+			!supports_format(*pdev, VK_FORMAT_R16G16B16A16_SFLOAT, motion_history_features) ||
+			!supports_format(*pdev, VK_FORMAT_R8_UNORM, motion_bias_features))
 		{
-			rsx_log.warning("DLSS temporal path: no storage-capable RG16F/RGBA16F motion formats");
+			rsx_log.warning("DLSS temporal path: no storage-capable motion formats");
 			return false;
 		}
 
@@ -695,6 +819,9 @@ namespace vk
 		m_motion_filtered = make_image(VK_FORMAT_R16G16_SFLOAT, input_size.width, input_size.height,
 			VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
 			VMM_ALLOCATION_POOL_SWAPCHAIN);
+		m_motion_bias = make_image(VK_FORMAT_R8_UNORM, input_size.width, input_size.height,
+			VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+			VMM_ALLOCATION_POOL_SWAPCHAIN);
 		m_previous_motion = make_image(VK_FORMAT_R16G16B16A16_SFLOAT, input_size.width, input_size.height,
 			VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
 			VMM_ALLOCATION_POOL_SWAPCHAIN);
@@ -709,9 +836,9 @@ namespace vk
 				VMM_ALLOCATION_POOL_SWAPCHAIN);
 		}
 
-		if (!m_previous_color || !m_motion || !m_motion_meta || !m_motion_filtered || !m_previous_motion || !m_output ||
+		if (!m_previous_color || !m_motion || !m_motion_meta || !m_motion_filtered || !m_motion_bias || !m_previous_motion || !m_output ||
 			!m_previous_color->value || !m_motion->value || !m_motion_meta->value ||
-			!m_motion_filtered->value || !m_previous_motion->value || !m_output->value)
+			!m_motion_filtered->value || !m_motion_bias->value || !m_previous_motion->value || !m_output->value)
 		{
 			dispose_images();
 			return false;
@@ -725,6 +852,7 @@ namespace vk
 		m_motion->set_debug_name("DLSS temporal motion vectors");
 		m_motion_meta->set_debug_name("DLSS temporal motion metadata");
 		m_motion_filtered->set_debug_name("DLSS temporal filtered motion vectors");
+		m_motion_bias->set_debug_name("DLSS temporal motion bias mask");
 		m_previous_motion->set_debug_name("DLSS temporal previous motion vectors");
 		m_output->set_debug_name("DLSS temporal output");
 		if (m_native_output)
@@ -842,12 +970,13 @@ namespace vk
 				input_size, requested_output_size, selected_dlss_mode, dlss_output_size);
 		}
 
-		if (!m_output || !m_previous_color || !m_motion || !m_motion_meta || !m_motion_filtered || !m_previous_motion || m_input_format != src->format() ||
+		if (!m_output || !m_previous_color || !m_motion || !m_motion_meta || !m_motion_filtered || !m_motion_bias || !m_previous_motion || m_input_format != src->format() ||
 			m_previous_color->width() != src->width() ||
 			m_previous_color->height() != src->height() || m_motion->width() != input_size.width ||
 			m_motion_meta->width() != input_size.width || m_motion_filtered->width() != input_size.width ||
+			m_motion_bias->width() != input_size.width ||
 			m_motion->height() != input_size.height || m_motion_meta->height() != input_size.height ||
-			m_motion_filtered->height() != input_size.height ||
+			m_motion_filtered->height() != input_size.height || m_motion_bias->height() != input_size.height ||
 			m_output->width() != dlss_output_size.width ||
 			m_output->height() != dlss_output_size.height)
 		{
@@ -872,9 +1001,39 @@ namespace vk
 		const bool camera_cut = m_has_history && inputs.has_camera_view_projection &&
 			m_has_previous_camera_view_projection && camera_discontinuity(
 				inputs.camera_view_projection, m_previous_camera_view_projection);
-		const bool reset = inputs.reset_history || !m_has_history || camera_cut;
+
+		u32 unexplained_change = 0;
+		u32 confident_motion = 0;
+		const bool have_scene_metrics = read_scene_change_counters(input_size, unexplained_change, confident_motion);
+		const u64 pixel_count = static_cast<u64>(input_size.width) * input_size.height;
+		const float changed_fraction = have_scene_metrics && pixel_count
+			? static_cast<float>(unexplained_change) / pixel_count
+			: 0.f;
+		const float motion_fraction = have_scene_metrics && pixel_count
+			? static_cast<float>(confident_motion) / pixel_count
+			: 0.f;
+
+		++m_scene_frames_since_reset;
+		bool scene_cut = false;
+		if (have_scene_metrics)
+		{
+			const bool changing = m_scene_was_changing
+				? changed_fraction >= 0.55f
+				: changed_fraction >= 0.85f;
+			if (motion_fraction >= 0.02f)
+			{
+				m_scene_motion_meter_warm = true;
+			}
+			scene_cut = m_has_history && changing && !m_scene_was_changing &&
+				m_scene_motion_meter_warm && motion_fraction < 0.02f &&
+				m_scene_frames_since_reset >= 45;
+			m_scene_was_changing = changing;
+		}
+
+		const bool reset = inputs.reset_history || !m_has_history || camera_cut || scene_cut;
 		if (reset)
 		{
+			m_scene_frames_since_reset = 0;
 			copy_current_to_history(cmd, src, input_size);
 		}
 
@@ -921,6 +1080,13 @@ namespace vk
 
 		src->push_layout(cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 		m_previous_color->push_layout(cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+		if (m_previous_motion->current_layout == VK_IMAGE_LAYOUT_UNDEFINED)
+		{
+			// The first motion pass only uses this image for the optional bias
+			// probe, which is disabled on the reset frame. Establish a valid
+			// sampled layout before the first real history copy arrives.
+			m_previous_motion->change_layout(cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+		}
 
 		if (m_motion->current_layout == VK_IMAGE_LAYOUT_GENERAL)
 		{
@@ -930,8 +1096,13 @@ namespace vk
 		{
 			insert_temporal_write_read_barrier(cmd, *m_motion_meta, VK_ACCESS_SHADER_WRITE_BIT);
 		}
+		if (m_motion_bias->current_layout == VK_IMAGE_LAYOUT_GENERAL)
+		{
+			insert_temporal_write_read_barrier(cmd, *m_motion_bias, VK_ACCESS_SHADER_WRITE_BIT);
+		}
 		m_motion->change_layout(cmd, VK_IMAGE_LAYOUT_GENERAL);
 		m_motion_meta->change_layout(cmd, VK_IMAGE_LAYOUT_GENERAL);
+		m_motion_bias->change_layout(cmd, VK_IMAGE_LAYOUT_GENERAL);
 		m_output->change_layout(cmd, VK_IMAGE_LAYOUT_GENERAL);
 		if (native_configuration_valid)
 		{
@@ -942,17 +1113,27 @@ namespace vk
 		const bool has_camera_pair = has_depth && !reset && inputs.has_camera_view_projection &&
 			m_has_previous_camera_view_projection && make_clip_to_previous(
 				inputs.camera_view_projection, m_previous_camera_view_projection, clip_to_previous);
+		const float jitter_delta_x = !reset && m_has_previous_jitter
+			? inputs.jitter_x - m_previous_jitter_x
+			: 0.f;
+		const float jitter_delta_y = !reset && m_has_previous_jitter
+			? inputs.jitter_y - m_previous_jitter_y
+			: 0.f;
 
 		vk::get_compute_task<vk::temporal::motion_pass>()->run(cmd, src, m_previous_color.get(),
-			has_depth ? depth_for_temporal : nullptr, m_motion.get(), m_motion_meta.get(), input_size, dlss_output_size,
-			has_camera_pair ? &clip_to_previous : nullptr, reset);
+			has_depth ? depth_for_temporal : nullptr, m_motion.get(), m_motion_meta.get(), m_previous_motion.get(), m_motion_bias.get(),
+			input_size, dlss_output_size,
+			has_camera_pair ? &clip_to_previous : nullptr, jitter_delta_x, jitter_delta_y,
+			prepare_scene_change_buffer(input_size), g_cfg.video.dlss_motion_bias.get(), reset);
 		insert_temporal_write_read_barrier(cmd, *m_motion);
 		insert_temporal_write_read_barrier(cmd, *m_motion_meta);
+		insert_temporal_write_read_barrier(cmd, *m_motion_bias);
 		m_motion->change_layout(cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 		m_motion_filtered->change_layout(cmd, VK_IMAGE_LAYOUT_GENERAL);
 		vk::get_compute_task<vk::temporal::motion_filter_pass>()->run(cmd, m_motion.get(), m_motion_filtered.get(), input_size);
 		insert_temporal_write_read_barrier(cmd, *m_motion_filtered);
 		m_motion_filtered->change_layout(cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+		m_motion_bias->change_layout(cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 		if (reset)
 		{
 			// Prime the previous-depth channel before the first resolve. History is
@@ -973,6 +1154,9 @@ namespace vk
 			// camera vector.
 			m_has_previous_camera_view_projection = false;
 		}
+		m_previous_jitter_x = inputs.jitter_x;
+		m_previous_jitter_y = inputs.jitter_y;
+		m_has_previous_jitter = true;
 
 		bool native_dlss_evaluated = false;
 		if (!g_cfg.video.dlss_frame_generation.get() && streamline.frame_generation_proxy_armed())
@@ -986,6 +1170,10 @@ namespace vk
 			const auto* output_view = m_native_output->get_view(remap);
 			const auto* depth_view = depth_for_temporal->get_view(remap, VK_IMAGE_ASPECT_DEPTH_BIT);
 			const auto* motion_view = m_motion_filtered->get_view(remap);
+			const auto* bias_view = m_motion_bias->get_view(remap);
+			const bool use_raw_frame_generation_motion = g_cfg.video.dlss_frame_generation_raw_motion.get();
+			auto* frame_generation_motion = use_raw_frame_generation_motion ? m_motion.get() : m_motion_filtered.get();
+			const auto* frame_generation_motion_view = frame_generation_motion->get_view(remap);
 
 			streamline_dlss::texture input_texture
 			{
@@ -1006,12 +1194,23 @@ namespace vk
 				m_motion_filtered->value, motion_view->value, m_motion_filtered->format(), m_motion_filtered->current_layout,
 				m_motion_filtered->width(), m_motion_filtered->height()
 			};
+			streamline_dlss::texture bias_texture
+			{
+				m_motion_bias->value, bias_view->value, m_motion_bias->format(), m_motion_bias->current_layout,
+				m_motion_bias->width(), m_motion_bias->height()
+			};
+			streamline_dlss::texture frame_generation_motion_texture
+			{
+				frame_generation_motion->value, frame_generation_motion_view->value, frame_generation_motion->format(),
+				frame_generation_motion->current_layout, frame_generation_motion->width(), frame_generation_motion->height()
+			};
 
 			if (streamline.set_options(0, selected_dlss_mode, dlss_output_size.width, dlss_output_size.height,
 				is_hdr_color_format(src->format())))
 			{
 				native_dlss_evaluated = streamline.evaluate(cmd, 0, static_cast<u32>(vk::get_current_frame_id()), reset,
-					inputs.jitter_x, inputs.jitter_y, input_texture, output_texture, depth_texture, motion_texture);
+					inputs.jitter_x, inputs.jitter_y, input_texture, output_texture, depth_texture, motion_texture,
+					g_cfg.video.dlss_motion_bias.get() ? &bias_texture : nullptr);
 
 				if (native_dlss_evaluated && g_cfg.video.dlss_frame_generation.get() &&
 					streamline.frame_generation_available() && streamline.frame_generation_proxy_armed())
@@ -1023,9 +1222,9 @@ namespace vk
 
 					if (streamline.configure_frame_generation(0, color_width, color_height, color_format, backbuffer_count,
 						g_cfg.video.dlss_frame_generation_frames.get(),
-						depth_texture, motion_texture))
+						depth_texture, frame_generation_motion_texture))
 					{
-						streamline.tag_frame(cmd, depth_texture, motion_texture);
+						streamline.tag_frame(cmd, depth_texture, frame_generation_motion_texture);
 					}
 				}
 			}

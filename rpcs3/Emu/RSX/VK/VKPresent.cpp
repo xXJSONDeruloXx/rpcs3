@@ -10,6 +10,7 @@
 #include "upscalers/bilinear_pass.hpp"
 #include "upscalers/fsr_pass.h"
 #include "upscalers/nearest_pass.hpp"
+#include "upscalers/temporal/camera_capture.h"
 #include "upscalers/temporal/temporal_pass.h"
 #include "util/asm.hpp"
 #include "util/video_provider.h"
@@ -25,147 +26,11 @@ extern atomic_t<recording_mode> g_recording_mode;
 
 namespace
 {
-	using camera_matrix = std::array<float, 16>;
-
-	void load_camera_matrix(const std::array<u32[4], 512>& constants, u32 slot, camera_matrix& result)
-	{
-		for (u32 row = 0; row < 4; ++row)
-		{
-			for (u32 column = 0; column < 4; ++column)
-			{
-				float value;
-				const u32 raw = constants[slot + row][column];
-				std::memcpy(&value, &raw, sizeof(value));
-				result[row * 4 + column] = value;
-			}
-		}
-	}
-
-	bool is_orthonormal_view(const camera_matrix& matrix)
-	{
-		for (float value : matrix)
-		{
-			if (!std::isfinite(value))
-			{
-				return false;
-			}
-		}
-
-		if (std::abs(matrix[12]) > 1e-3f || std::abs(matrix[13]) > 1e-3f ||
-			std::abs(matrix[14]) > 1e-3f || std::abs(matrix[15] - 1.f) > 1e-3f)
-		{
-			return false;
-		}
-
-		for (u32 row = 0; row < 3; ++row)
-		{
-			const float length = matrix[row * 4] * matrix[row * 4] +
-				matrix[row * 4 + 1] * matrix[row * 4 + 1] +
-				matrix[row * 4 + 2] * matrix[row * 4 + 2];
-			if (std::abs(length - 1.f) > 0.02f)
-			{
-				return false;
-			}
-		}
-
-		for (u32 a = 0; a < 3; ++a)
-		{
-			for (u32 b = a + 1; b < 3; ++b)
-			{
-				const float dot = matrix[a * 4] * matrix[b * 4] +
-					matrix[a * 4 + 1] * matrix[b * 4 + 1] +
-					matrix[a * 4 + 2] * matrix[b * 4 + 2];
-				if (std::abs(dot) > 0.02f)
-				{
-					return false;
-				}
-			}
-		}
-
-		return true;
-	}
-
-	bool is_perspective_projection(const camera_matrix& matrix)
-	{
-		return matrix[0] > 0.05f && std::abs(matrix[1]) < 1e-4f && std::abs(matrix[2]) < 1e-4f && std::abs(matrix[3]) < 1e-4f &&
-			std::abs(matrix[4]) < 1e-4f && matrix[5] > 0.05f && std::abs(matrix[6]) < 1e-4f && std::abs(matrix[7]) < 1e-4f &&
-			std::abs(matrix[8]) < 1e-4f && std::abs(matrix[9]) < 1e-4f &&
-			std::abs(matrix[12]) < 1e-4f && std::abs(matrix[13]) < 1e-4f &&
-			std::abs(std::abs(matrix[14]) - 1.f) < 0.01f && std::abs(matrix[15]) < 1e-3f;
-	}
-
-	bool is_square_projection(const camera_matrix& matrix)
-	{
-		return matrix[5] > 0.05f && std::abs(std::abs(matrix[0] / matrix[5]) - 1.f) < 0.2f;
-	}
-
-	bool product_matches(const camera_matrix& projection, const camera_matrix& view, const camera_matrix& view_projection)
-	{
-		for (u32 row = 0; row < 4; ++row)
-		{
-			for (u32 column = 0; column < 4; ++column)
-			{
-				float expected = 0.f;
-				for (u32 k = 0; k < 4; ++k)
-				{
-					expected += projection[row * 4 + k] * view[k * 4 + column];
-				}
-
-				const float tolerance = std::max(0.02f, std::abs(expected) * 0.01f);
-				if (std::abs(view_projection[row * 4 + column] - expected) > tolerance)
-				{
-					return false;
-				}
-			}
-		}
-
-		return true;
-	}
+	using camera_matrix = vk::temporal_camera::matrix;
 
 	bool capture_guest_camera(const rsx::context* context, float expected_aspect, camera_matrix& result)
 	{
-		if (!context)
-		{
-			return false;
-		}
-
-		const auto& constants = REGS(context)->transform_constants;
-		float best_aspect_error = std::numeric_limits<float>::max();
-		bool found = false;
-
-		for (u32 slot = 0; slot + 11 < constants.size(); ++slot)
-		{
-			camera_matrix view{};
-			camera_matrix projection{};
-			camera_matrix view_projection{};
-			load_camera_matrix(constants, slot, view);
-			load_camera_matrix(constants, slot + 4, projection);
-			load_camera_matrix(constants, slot + 8, view_projection);
-
-			if (!is_orthonormal_view(view) || !is_perspective_projection(projection) ||
-				is_square_projection(projection) ||
-				!product_matches(projection, view, view_projection))
-			{
-				continue;
-			}
-
-			const float projection_aspect = std::abs(projection[0] / projection[5]);
-			if (!std::isfinite(projection_aspect) || projection_aspect <= 0.f)
-			{
-				continue;
-			}
-
-			const float aspect_error = std::min(std::abs(projection_aspect - expected_aspect),
-				std::abs(1.f / projection_aspect - expected_aspect));
-			if (!found || aspect_error < best_aspect_error)
-			{
-				found = true;
-				best_aspect_error = aspect_error;
-				result = view_projection;
-			}
-		}
-
-		return found;
+		return context && vk::temporal_camera::capture(REGS(context)->transform_constants, expected_aspect, result);
 	}
 
 	VkFormat RSX_display_format_to_vk_format(u8 format)
@@ -232,6 +97,12 @@ bool VKGSRender::reinitialize_swapchain()
 	vk::get_streamline_dlss().prepare_swapchain_recreation();
 	m_upscaler.reset();
 	clear_temporal_depth_candidate();
+	m_temporal_jitter_enabled = false;
+	m_temporal_jitter_x = 0.f;
+	m_temporal_jitter_y = 0.f;
+	m_temporal_jitter_render_width = 0;
+	m_temporal_jitter_render_height = 0;
+	m_temporal_jitter_index = 1;
 
 	// Drain all the queues
 	vk::get_streamline_dlss().device_wait_idle(*m_device);
@@ -976,6 +847,12 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 			temporal_inputs.present_height = static_cast<u32>(m_swapchain_dims.height);
 			temporal_inputs.present_buffer_count = m_swapchain->get_swap_image_count();
 			temporal_inputs.present_format = m_swapchain->get_surface_format();
+			// Streamline's Vulkan convention uses the opposite Y sign from the
+			// clip-space offset applied by the generated guest vertex shader. Keep
+			// the carrier in the declaration convention so native DLSS and the
+			// fallback's de-jitter delta stay aligned with the Beast integration.
+			temporal_inputs.jitter_x = m_temporal_jitter_enabled ? m_temporal_jitter_x : 0.f;
+			temporal_inputs.jitter_y = m_temporal_jitter_enabled ? -m_temporal_jitter_y : 0.f;
 			temporal_inputs.has_camera_view_projection = capture_guest_camera(
 				m_ctx,
 				buffer_height ? static_cast<float>(buffer_width) / buffer_height : 1.f,
@@ -1209,4 +1086,5 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 	}
 
 	clear_temporal_depth_candidate();
+	advance_temporal_jitter(image_to_flip ? image_to_flip->width() : 0, image_to_flip ? image_to_flip->height() : 0);
 }

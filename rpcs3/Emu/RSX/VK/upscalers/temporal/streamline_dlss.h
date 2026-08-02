@@ -67,7 +67,8 @@ namespace vk
 			const texture& input,
 			const texture& output,
 			const texture& depth,
-			const texture& motion);
+			const texture& motion,
+			const texture* bias = nullptr);
 
 		bool configure_frame_generation(u32 viewport_id, u32 color_width, u32 color_height, VkFormat color_format,
 			u32 backbuffer_count, u32 frames_to_generate, const texture& depth, const texture& motion);

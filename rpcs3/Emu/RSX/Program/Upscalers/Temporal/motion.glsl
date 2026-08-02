@@ -12,11 +12,20 @@ layout(set = 0, binding = 1) uniform sampler2D PreviousTexture;
 layout(set = 0, binding = 2) uniform sampler2D DepthTexture;
 layout(set = 0, binding = 3, rg16f) uniform writeonly image2D MotionTexture;
 layout(set = 0, binding = 4, rgba16f) uniform writeonly image2D MotionMetadataTexture;
+layout(std430, set = 0, binding = 5) buffer SceneChange
+{
+	uint ChangedCount;
+	uint MotionCount;
+	uint Reserved[7];
+} scene_change;
+layout(set = 0, binding = 6) uniform sampler2D PreviousMotionMetadata;
+layout(set = 0, binding = 7, r8) uniform writeonly image2D BiasTexture;
 
 layout(push_constant) uniform PushConstants
 {
 	vec4 InputOutputSize; // input width/height, output width/height
 	vec4 Flags;           // reset, has-depth, camera-pair, depth-inverted
+	vec4 JitterDelta;     // current jitter minus previous jitter, in render pixels
 	vec4 CameraClipToPrevious[4]; // row-major clip-space transform, when camera-pair is set
 } params;
 
@@ -175,6 +184,9 @@ void main()
 		}
 
 		confidence = 1.0 - clamp(best_error * 4.0, 0.0, 1.0);
+		// Color flow observes the apparent shift caused by camera jitter. Add the
+		// opposite of that apparent motion so the field handed to DLSS is clean.
+		best_offset += params.JitterDelta.xy;
 	}
 
 	best_offset = clamp(best_offset, vec2(-32.0), vec2(32.0));
@@ -186,8 +198,76 @@ void main()
 		confidence *= 0.75;
 	}
 
+	// Keep a cheap one-frame-late scene-cut meter alongside the field. A large
+	// local temporal change that the patch model cannot explain is a useful cut
+	// signal; confident vectors over one pixel identify ordinary camera/object
+	// motion and keep the CPU-side hysteresis from resetting during gameplay.
+	float temporal_change = patch_error(CurrentTexture, PreviousTexture, uv, uv, texel) / 9.0;
+	if (temporal_change > 0.08 && confidence < 0.4)
+	{
+		atomicAdd(scene_change.ChangedCount, 1u);
+	}
+	if (confidence > 0.5 && dot(best_offset, best_offset) > 1.0)
+	{
+		atomicAdd(scene_change.MotionCount, 1u);
+	}
+
+	float motion_bias = 0.0;
+	if (params.JitterDelta.z > 0.5 && params.Flags.y > 0.5 && params.Flags.x < 0.5)
+	{
+		// A camera move changes the current depth and the previous depth at the
+		// same world point. Compare the reprojected previous-frame depth instead
+		// of comparing the two raw samples directly; otherwise every translation
+		// would look like an object-disocclusion event.
+		if (camera_motion_valid)
+		{
+			float current_depth = texture(DepthTexture, uv).r;
+			float current_ndc_depth = params.Flags.w > 0.5 ? current_depth * 2.0 - 1.0 : current_depth;
+			vec4 current_clip = vec4(uv * 2.0 - 1.0, current_ndc_depth, 1.0);
+			vec4 previous_clip = vec4(
+				dot(params.CameraClipToPrevious[0], current_clip),
+				dot(params.CameraClipToPrevious[1], current_clip),
+				dot(params.CameraClipToPrevious[2], current_clip),
+				dot(params.CameraClipToPrevious[3], current_clip));
+			float predicted_depth = 0.0;
+			if (abs(previous_clip.w) > 1e-5)
+			{
+				float previous_ndc_depth = previous_clip.z / previous_clip.w;
+				predicted_depth = params.Flags.w > 0.5 ? previous_ndc_depth * 0.5 + 0.5 : previous_ndc_depth;
+			}
+
+			vec2 previous_uv = clamp(predicted_previous_uv, vec2(0.0001), vec2(0.9999));
+			vec2 texel = 1.0 / max(params.InputOutputSize.xy, vec2(1.0));
+			float best_relative_depth_error = 1e20;
+			for (int tap = 0; tap < 5; ++tap)
+			{
+				vec2 offset = tap == 0 ? vec2(0.0) :
+					tap == 1 ? vec2(texel.x, 0.0) :
+					tap == 2 ? vec2(-texel.x, 0.0) :
+					tap == 3 ? vec2(0.0, texel.y) :
+					vec2(0.0, -texel.y);
+				float previous_depth = texture(PreviousMotionMetadata,
+					clamp(previous_uv + offset, vec2(0.0001), vec2(0.9999))).a;
+				float relative_error = abs(predicted_depth - previous_depth) /
+					max(max(abs(predicted_depth), abs(previous_depth)), 0.01);
+				best_relative_depth_error = min(best_relative_depth_error, relative_error);
+			}
+
+			motion_bias = predicted_depth <= 0.0 || predicted_depth >= 1.0 ||
+				best_relative_depth_error > 0.15 ? 1.0 : 0.0;
+		}
+		else
+		{
+			// With no camera pair there is no defensible depth prediction. Keep
+			// the optional hint conservative and let the color-flow confidence
+			// determine history usage.
+			motion_bias = 0.0;
+		}
+	}
+
 	float depth = params.Flags.y > 0.5 ? texture(DepthTexture, uv).r : 0.0;
 	imageStore(MotionTexture, pixel, vec4(best_offset, 0.0, 0.0));
 	imageStore(MotionMetadataTexture, pixel, vec4(best_offset, confidence, depth));
+	imageStore(BiasTexture, pixel, vec4(motion_bias, 0.0, 0.0, 1.0));
 }
 )"

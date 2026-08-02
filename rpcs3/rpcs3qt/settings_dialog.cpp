@@ -563,7 +563,10 @@ settings_dialog::settings_dialog(std::shared_ptr<gui_settings> gui_settings, std
 
 	EnhanceComboBox(emu_settings_type::OutputScalingMode, ui->outputScalingMode, tooltips.settings.output_scaling_mode);
 	EnhanceComboBox(emu_settings_type::DlssQualityMode, ui->dlssQualityMode, tooltips.settings.output_scaling_mode);
+	EnhanceCheckBox(emu_settings_type::DlssJitter, ui->dlssJitter, tooltips.settings.output_scaling_mode);
+	EnhanceCheckBox(emu_settings_type::DlssMotionBias, ui->dlssMotionBias, tooltips.settings.output_scaling_mode);
 	EnhanceCheckBox(emu_settings_type::DlssFrameGeneration, ui->dlssFrameGeneration, tooltips.settings.output_scaling_mode);
+	EnhanceCheckBox(emu_settings_type::DlssFrameGenerationRawMotion, ui->dlssFrameGenerationRawMotion, tooltips.settings.output_scaling_mode);
 	m_emu_settings->EnhanceSpinBox(ui->dlssFrameGenerationFrames, emu_settings_type::DlssFrameGenerationFrames);
 
 	// 3D
@@ -854,7 +857,10 @@ settings_dialog::settings_dialog(std::shared_ptr<gui_settings> gui_settings, std
 		ui->fsrSharpeningStrengthReset->setEnabled(fsr_selected);
 		const bool dlss_selected = static_cast<output_scaling_mode>(value) == output_scaling_mode::dlss;
 		ui->dlssQualityMode->setEnabled(dlss_selected);
+		ui->dlssJitter->setEnabled(dlss_selected);
+		ui->dlssMotionBias->setEnabled(dlss_selected);
 		ui->dlssFrameGeneration->setEnabled(dlss_selected);
+		ui->dlssFrameGenerationRawMotion->setEnabled(dlss_selected && ui->dlssFrameGeneration->isChecked());
 		ui->dlssFrameGenerationFrames->setEnabled(dlss_selected && ui->dlssFrameGeneration->isChecked());
 	};
 
@@ -869,6 +875,7 @@ settings_dialog::settings_dialog(std::shared_ptr<gui_settings> gui_settings, std
 	{
 		const auto [text, value] = get_data(ui->outputScalingMode, ui->outputScalingMode->currentIndex());
 		ui->dlssFrameGenerationFrames->setEnabled(static_cast<output_scaling_mode>(value) == output_scaling_mode::dlss && ui->dlssFrameGeneration->isChecked());
+		ui->dlssFrameGenerationRawMotion->setEnabled(static_cast<output_scaling_mode>(value) == output_scaling_mode::dlss && ui->dlssFrameGeneration->isChecked());
 	});
 
 	//                      _ _         _______    _

@@ -779,9 +779,30 @@
                 <widget class="QComboBox" name="dlssQualityMode"/>
                </item>
                <item>
+                <widget class="QCheckBox" name="dlssJitter">
+                 <property name="text">
+                  <string>Enable DLSS Rendering Jitter</string>
+                 </property>
+                </widget>
+               </item>
+               <item>
+                <widget class="QCheckBox" name="dlssMotionBias">
+                 <property name="text">
+                  <string>Use DLSS Motion Bias Mask</string>
+                 </property>
+                </widget>
+               </item>
+               <item>
                 <widget class="QCheckBox" name="dlssFrameGeneration">
                  <property name="text">
                   <string>Enable DLSS Frame Generation</string>
+                 </property>
+                </widget>
+               </item>
+               <item>
+                <widget class="QCheckBox" name="dlssFrameGenerationRawMotion">
+                 <property name="text">
+                  <string>Use Raw Motion for Frame Generation</string>
                  </property>
                 </widget>
                </item>
