@@ -61,7 +61,7 @@ namespace vk
 				streamline_dlss::mode::ultra_performance,
 			};
 
-			long best_delta = std::numeric_limits<long>::max();
+			s64 best_delta = std::numeric_limits<s64>::max();
 			bool found = false;
 			for (u32 candidate_index = 0; candidate_index < candidates.size(); ++candidate_index)
 			{
@@ -109,8 +109,10 @@ namespace vk
 					continue;
 				}
 
-				const long delta = std::abs(static_cast<long>(candidate_width) - requested_output.width) +
-					std::abs(static_cast<long>(candidate_height) - requested_output.height);
+				const s64 width_delta = static_cast<s64>(candidate_width) - static_cast<s64>(requested_output.width);
+				const s64 height_delta = static_cast<s64>(candidate_height) - static_cast<s64>(requested_output.height);
+				const s64 delta = (width_delta < 0 ? -width_delta : width_delta) +
+					(height_delta < 0 ? -height_delta : height_delta);
 				if (!found || delta < best_delta)
 				{
 					found = true;
