@@ -133,7 +133,7 @@ namespace vk
 			resource* resource_ptr;
 			u32 buffer_type;
 			u32 lifecycle;
-			extent extent;
+			streamline_dlss::extent extent;
 		};
 
 		struct mat4
