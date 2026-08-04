@@ -615,7 +615,7 @@ namespace vk
 			m_motion_image = motion->get_view(remap);
 			m_previous_motion_image = previous_motion->get_view(remap);
 			m_depth_image = depth
-				? depth->get_view(remap, VK_IMAGE_ASPECT_DEPTH_BIT)
+				? depth->get_view(remap, (depth->aspect() & VK_IMAGE_ASPECT_DEPTH_BIT) ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT)
 				: m_current_image;
 			m_output_image = output->get_view(remap);
 
