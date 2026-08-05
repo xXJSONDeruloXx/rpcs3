@@ -3,6 +3,7 @@
 #include "streamline_dlss.h"
 
 #include "../../vkutils/device.h"
+#include "rpcs3_version.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -213,6 +214,10 @@ namespace vk
 		pref.features_to_load = m_features.data();
 		pref.num_features_to_load = static_cast<u32>(m_features.size());
 		pref.engine = 0; // eCustom
+		const std::string engine_version = rpcs3::get_version().to_string(true);
+		pref.engine_version = engine_version.c_str();
+		// UUID v5 derived from RPCS3's canonical repository URL.
+		pref.project_id = "24cb96f8-8496-5200-9346-3f47864b0f68";
 		pref.render_api = 2; // eVulkan
 
 		constexpr u64 sdk_version = (u64(2) << 48) | (u64(12) << 32) | (u64(0) << 16) | 0xfedc;
