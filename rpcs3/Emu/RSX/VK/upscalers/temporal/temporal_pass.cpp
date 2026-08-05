@@ -898,7 +898,7 @@ namespace vk
 		const size2u requested_output_size = output_size;
 		const size2u dlss_output_size = requested_output_size;
 		streamline_dlss::mode selected_dlss_mode = requested_dlss_mode;
-		const dlss_preset selected_dlss_preset = g_cfg.video.dlss_preset.get();
+		const dlss_preset selected_dlss_preset = g_cfg.video.dlss_preset_selection.get();
 		bool native_configuration_valid = streamline.available() &&
 			((inputs.depth && inputs.depth->value && inputs.depth->samples() == 1) || inputs.allow_dummy_depth);
 

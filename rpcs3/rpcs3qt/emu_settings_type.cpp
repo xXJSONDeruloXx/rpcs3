@@ -109,7 +109,7 @@ const std::map<emu_settings_type, cfg_location> settings_location =
 	{ emu_settings_type::DisableMSLFastMath,         get_cfg_location(local_cfg.video.disable_msl_fast_math) },
 	{ emu_settings_type::OutputScalingMode,          get_cfg_location(local_cfg.video.output_scaling) },
 	{ emu_settings_type::DlssQualityMode,           get_cfg_location(local_cfg.video.dlss_quality) },
-	{ emu_settings_type::DlssPreset,                get_cfg_location(local_cfg.video.dlss_preset) },
+	{ emu_settings_type::DlssPreset,                get_cfg_location(local_cfg.video.dlss_preset_selection) },
 	{ emu_settings_type::DlssJitter,                get_cfg_location(local_cfg.video.dlss_jitter) },
 	{ emu_settings_type::DlssMotionBias,            get_cfg_location(local_cfg.video.dlss_motion_bias) },
 	{ emu_settings_type::DlssMotionDynamicMask,     get_cfg_location(local_cfg.video.dlss_motion_dynamic_mask) },

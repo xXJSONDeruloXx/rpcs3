@@ -178,7 +178,7 @@ struct cfg_root : cfg::node
 		cfg::_bool disable_async_host_memory_manager{ this, "Disable Asynchronous Memory Manager", false, true };
 		cfg::_enum<output_scaling_mode> output_scaling{ this, "Output Scaling Mode", output_scaling_mode::bilinear, true };
 		cfg::_enum<dlss_quality_mode> dlss_quality{ this, "DLSS Quality Mode", dlss_quality_mode::balanced, true };
-		cfg::_enum<dlss_preset> dlss_preset{ this, "DLSS Preset", dlss_preset::k, true };
+		cfg::_enum<dlss_preset> dlss_preset_selection{ this, "DLSS Preset", dlss_preset::k, true };
 		cfg::_bool dlss_jitter{ this, "DLSS Rendering Jitter", false, true };
 		cfg::_bool dlss_motion_bias{ this, "DLSS Motion Bias Mask", false, true };
 		cfg::_bool dlss_motion_dynamic_mask{ this, "DLSS Dynamic Motion Mask", false, true };
