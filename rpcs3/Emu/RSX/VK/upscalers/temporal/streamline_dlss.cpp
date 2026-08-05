@@ -422,13 +422,13 @@ namespace vk
 		options.exposure_scale = 1.f;
 		options.color_buffers_hdr = hdr ? 1 : 0;
 		options.use_auto_exposure = 1;
-		// Preset K is the current default in the Beast integration. This is an
-		// option slot, not a proprietary model or binary shipped by RPCS3.
+		// Use the fixed presets recommended by Streamline for each quality tier.
+		// These are option values only; RPCS3 does not ship a proprietary model.
 		options.dlaa_preset = 11;
 		options.quality_preset = 11;
 		options.balanced_preset = 11;
-		options.performance_preset = 11;
-		options.ultra_performance_preset = 11;
+		options.performance_preset = 13;
+		options.ultra_performance_preset = 12;
 		options.ultra_quality_preset = 11;
 
 		const auto viewport = make_viewport(viewport_id);
