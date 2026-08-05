@@ -1168,28 +1168,43 @@ namespace vk
 				frame_generation_motion->current_layout, frame_generation_motion->width(), frame_generation_motion->height()
 			};
 
-			if (streamline.set_options(inputs.viewport_id, selected_dlss_mode, dlss_output_size.width, dlss_output_size.height,
-				is_hdr_color_format(src->format()), static_cast<u32>(selected_dlss_preset)))
+			const u32 requested_dlss_preset = static_cast<u32>(selected_dlss_preset);
+			const u32 fallback_dlss_preset = static_cast<u32>(dlss_preset::k);
+			auto evaluate_with_preset = [&](u32 preset)
 			{
-				native_dlss_evaluated = streamline.evaluate(cmd, inputs.viewport_id, static_cast<u32>(vk::get_current_frame_id()), reset,
+				if (!streamline.set_options(inputs.viewport_id, selected_dlss_mode, dlss_output_size.width, dlss_output_size.height,
+					is_hdr_color_format(src->format()), preset))
+				{
+					return false;
+				}
+
+				return streamline.evaluate(cmd, inputs.viewport_id, static_cast<u32>(vk::get_current_frame_id()), reset,
 					inputs.jitter_x, inputs.jitter_y, input_texture, output_texture, depth_texture, motion_texture,
 					g_cfg.video.dlss_motion_bias.get() ? &bias_texture : nullptr);
+			};
 
-				if (native_dlss_evaluated && inputs.allow_frame_generation && inputs.viewport_id == 0 &&
-					g_cfg.video.dlss_frame_generation.get() &&
-					streamline.frame_generation_available() && streamline.frame_generation_proxy_armed())
+			native_dlss_evaluated = evaluate_with_preset(requested_dlss_preset);
+			if (!native_dlss_evaluated && requested_dlss_preset != fallback_dlss_preset)
+			{
+				rsx_log.warning("DLSS: preset %c was rejected; retrying native evaluation with preset K",
+					static_cast<char>('A' + requested_dlss_preset));
+				native_dlss_evaluated = evaluate_with_preset(fallback_dlss_preset);
+			}
+
+			if (native_dlss_evaluated && inputs.allow_frame_generation && inputs.viewport_id == 0 &&
+				g_cfg.video.dlss_frame_generation.get() &&
+				streamline.frame_generation_available() && streamline.frame_generation_proxy_armed())
+			{
+				const u32 color_width = inputs.present_width ? inputs.present_width : requested_output_size.width;
+				const u32 color_height = inputs.present_height ? inputs.present_height : requested_output_size.height;
+				const VkFormat color_format = inputs.present_format != VK_FORMAT_UNDEFINED ? inputs.present_format : m_native_output->format();
+				const u32 backbuffer_count = inputs.present_buffer_count ? inputs.present_buffer_count : 2;
+
+				if (streamline.configure_frame_generation(0, color_width, color_height, color_format, backbuffer_count,
+					g_cfg.video.dlss_frame_generation_frames.get(),
+					depth_texture, frame_generation_motion_texture))
 				{
-					const u32 color_width = inputs.present_width ? inputs.present_width : requested_output_size.width;
-					const u32 color_height = inputs.present_height ? inputs.present_height : requested_output_size.height;
-					const VkFormat color_format = inputs.present_format != VK_FORMAT_UNDEFINED ? inputs.present_format : m_native_output->format();
-					const u32 backbuffer_count = inputs.present_buffer_count ? inputs.present_buffer_count : 2;
-
-					if (streamline.configure_frame_generation(0, color_width, color_height, color_format, backbuffer_count,
-						g_cfg.video.dlss_frame_generation_frames.get(),
-						depth_texture, frame_generation_motion_texture))
-					{
-						streamline.tag_frame(cmd, depth_texture, frame_generation_motion_texture);
-					}
+					streamline.tag_frame(cmd, depth_texture, frame_generation_motion_texture);
 				}
 			}
 		}
