@@ -519,6 +519,23 @@ namespace vk
 
 		// Set up instance information
 		std::vector<const char*> requested_extensions = { VK_KHR_SWAPCHAIN_EXTENSION_NAME };
+		const auto supported_device_extensions = vk::supported_extensions(
+			vk::supported_extensions::enumeration_class::device, nullptr, *pgpu);
+		const auto request_supported_extension = [&](const char* extension)
+		{
+			if (supported_device_extensions.is_supported(extension))
+			{
+				requested_extensions.push_back(extension);
+			}
+		};
+
+		// Streamline's Vulkan DLSS plugin uses NGX kernels and requires these
+		// extensions to be enabled on the host device. They are optional driver
+		// extensions, so request each one only when the selected adapter exposes it.
+		request_supported_extension(VK_NVX_BINARY_IMPORT_EXTENSION_NAME);
+		request_supported_extension(VK_NVX_IMAGE_VIEW_HANDLE_EXTENSION_NAME);
+		request_supported_extension(VK_EXT_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
+		request_supported_extension(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
 
 		// Enable hardware features manually
 		// Currently we require:
