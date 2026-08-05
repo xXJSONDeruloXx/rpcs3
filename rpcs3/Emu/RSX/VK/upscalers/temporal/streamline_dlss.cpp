@@ -264,6 +264,20 @@ namespace vk
 			return false;
 		}
 
+		// RPCS3 keeps Vulkan's native present path instead of loading Streamline
+		// as the Vulkan loader. Bind the common plugin's present hooks so its
+		// per-frame bookkeeping and garbage collection still run.
+		void* hook_present = nullptr;
+		void* hook_after_present = nullptr;
+		if (m_sl_get_feature_function(0xffffffffu, "slHookVkPresent", &hook_present) == 0 && hook_present)
+		{
+			m_sl_hook_vk_present = reinterpret_cast<sl_hook_vk_present_fn>(hook_present);
+		}
+		if (m_sl_get_feature_function(0xffffffffu, "slHookVkAfterPresent", &hook_after_present) == 0 && hook_after_present)
+		{
+			m_sl_hook_vk_after_present = reinterpret_cast<sl_hook_vk_after_present_fn>(hook_after_present);
+		}
+
 		adapter_info adapter{};
 		adapter.type = make_guid(0x0677315f, 0xa746, 0x4492, { 0x9f, 0x42, 0xcb, 0x61, 0x42, 0xc9, 0xc3, 0xd4 });
 		adapter.version = 1;
@@ -346,6 +360,9 @@ namespace vk
 		m_sl_pcl_set_marker = nullptr;
 		m_sl_dlssg_set_options = nullptr;
 		m_sl_dlssg_get_state = nullptr;
+		m_sl_hook_vk_present = nullptr;
+		m_sl_hook_vk_after_present = nullptr;
+		m_present_hook_failure_logged = false;
 		m_sl_init = nullptr;
 		m_sl_shutdown = nullptr;
 		m_sl_is_feature_supported = nullptr;
@@ -740,8 +757,18 @@ namespace vk
 		m_fg_size_stable_frames = 0;
 	}
 
-	void streamline_dlss::before_present()
+	void streamline_dlss::before_present(VkQueue queue)
 	{
+		if (!m_frame_generation_proxy_armed && m_sl_hook_vk_present && queue)
+		{
+			bool skip = false;
+			if (m_sl_hook_vk_present(queue, nullptr, skip) != VK_SUCCESS && !m_present_hook_failure_logged)
+			{
+				rsx_log.warning("DLSS: Streamline Vulkan present hook failed");
+				m_present_hook_failure_logged = true;
+			}
+		}
+
 		if (!m_frame_generation_frame_active || !m_last_frame_token || !m_sl_pcl_set_marker)
 		{
 			return;
@@ -754,6 +781,13 @@ namespace vk
 
 	void streamline_dlss::after_present()
 	{
+		if (!m_frame_generation_proxy_armed && m_sl_hook_vk_after_present &&
+			m_sl_hook_vk_after_present() != VK_SUCCESS && !m_present_hook_failure_logged)
+		{
+			rsx_log.warning("DLSS: Streamline Vulkan after-present hook failed");
+			m_present_hook_failure_logged = true;
+		}
+
 		if (!m_last_frame_token)
 		{
 			return;

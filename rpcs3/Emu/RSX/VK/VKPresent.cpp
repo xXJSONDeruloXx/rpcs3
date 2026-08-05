@@ -178,7 +178,7 @@ void VKGSRender::present(vk::frame_context_t *ctx)
 		// that was used for DLSS-SR. These markers are no-ops unless the temporal
 		// pass successfully tagged depth and motion for this frame.
 		auto& streamline = vk::get_streamline_dlss();
-		streamline.before_present();
+		streamline.before_present(m_device->get_present_queue());
 		const VkResult present_result = m_swapchain->present(ctx->present_wait_semaphore, ctx->present_image);
 
 		switch (present_result)

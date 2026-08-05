@@ -74,7 +74,7 @@ namespace vk
 			u32 backbuffer_count, u32 frames_to_generate, const texture& depth, const texture& motion);
 		bool tag_frame(VkCommandBuffer command_buffer, const texture& depth, const texture& motion);
 		void prepare_swapchain_recreation();
-		void before_present();
+		void before_present(VkQueue queue);
 		void after_present();
 		void* get_device_proc_addr(VkDevice device, const char* name) const;
 		VkResult device_wait_idle(VkDevice device) const;
@@ -349,6 +349,8 @@ namespace vk
 		using sl_pcl_set_marker_fn = sl_result (*)(u32, void*);
 		using sl_dlssg_set_options_fn = sl_result (*)(const viewport_handle&, const dlssg_options&);
 		using sl_dlssg_get_state_fn = sl_result (*)(const viewport_handle&, dlssg_state&, void*);
+		using sl_hook_vk_present_fn = VkResult (*)(VkQueue, const VkPresentInfoKHR*, bool&);
+		using sl_hook_vk_after_present_fn = VkResult (*)();
 
 		utils::dynamic_library m_interposer;
 		bool m_initialized = false;
@@ -413,6 +415,9 @@ namespace vk
 		sl_pcl_set_marker_fn m_sl_pcl_set_marker = nullptr;
 		sl_dlssg_set_options_fn m_sl_dlssg_set_options = nullptr;
 		sl_dlssg_get_state_fn m_sl_dlssg_get_state = nullptr;
+		sl_hook_vk_present_fn m_sl_hook_vk_present = nullptr;
+		sl_hook_vk_after_present_fn m_sl_hook_vk_after_present = nullptr;
+		bool m_present_hook_failure_logged = false;
 
 		static struct_type make_guid(u32 data1, u16 data2, u16 data3, std::initializer_list<u8> bytes);
 		static mat4 identity_matrix();
