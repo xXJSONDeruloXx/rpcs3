@@ -108,6 +108,7 @@ enum class emu_settings_type
 	DisableMSLFastMath,
 	OutputScalingMode,
 	DlssQualityMode,
+	DlssPreset,
 	DlssJitter,
 	DlssMotionBias,
 	DlssMotionDynamicMask,

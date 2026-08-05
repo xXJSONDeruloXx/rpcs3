@@ -359,6 +359,25 @@ enum class dlss_quality_mode
 	native
 };
 
+enum class dlss_preset
+{
+	a,
+	b,
+	c,
+	d,
+	e,
+	f,
+	g,
+	h,
+	i,
+	j,
+	k,
+	l,
+	m,
+	n,
+	o
+};
+
 enum class stereo_render_mode_options
 {
 	disabled,

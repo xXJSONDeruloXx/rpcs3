@@ -10,7 +10,6 @@
 
 #include <algorithm>
 #include <cmath>
-#include <limits>
 
 namespace vk
 {
@@ -18,112 +17,6 @@ namespace vk
 	{
 		constexpr u32 temporal_workgroup_size = 16;
 		constexpr u32 scene_change_counter_count = 9;
-
-		bool render_size_in_range(streamline_dlss& streamline, streamline_dlss::mode mode,
-			const size2u& input_size, const size2u& output_size)
-		{
-			u32 min_width = 0, min_height = 0, max_width = 0, max_height = 0;
-			return streamline.get_render_range(mode, output_size.width, output_size.height,
-				min_width, min_height, max_width, max_height) &&
-				input_size.width >= min_width && input_size.height >= min_height &&
-				input_size.width <= max_width && input_size.height <= max_height;
-		}
-
-		// Streamline does not accept an arbitrary render size for every output/mode pair.
-		// If the emulator's resolution scale misses the driver's dynamic range, derive the
-		// smallest final-res blit that puts the input on the mode's accepted interval. This
-		// is the same safety valve used by the Beast integration and avoids repeatedly calling
-		// slEvaluateFeature with a configuration that the active DLSS model rejects.
-		bool pick_dlss_render_size(streamline_dlss& streamline, streamline_dlss::mode preferred,
-			const size2u& input_size, const size2u& requested_output,
-			streamline_dlss::mode& selected_mode, size2u& selected_output)
-		{
-			selected_mode = preferred;
-			selected_output = requested_output;
-
-			if (preferred == streamline_dlss::mode::dlaa)
-			{
-				selected_output = input_size;
-				return true;
-			}
-
-			if (input_size.width >= requested_output.width || input_size.height >= requested_output.height)
-			{
-				return false;
-			}
-
-			const std::array<streamline_dlss::mode, 5> candidates =
-			{
-				preferred,
-				streamline_dlss::mode::max_quality,
-				streamline_dlss::mode::balanced,
-				streamline_dlss::mode::max_performance,
-				streamline_dlss::mode::ultra_performance,
-			};
-
-			s64 best_delta = std::numeric_limits<s64>::max();
-			bool found = false;
-			for (u32 candidate_index = 0; candidate_index < candidates.size(); ++candidate_index)
-			{
-				const auto candidate = candidates[candidate_index];
-				bool duplicate = false;
-				for (u32 previous_index = 0; previous_index < candidate_index; ++previous_index)
-				{
-					duplicate |= candidates[previous_index] == candidate;
-				}
-				if (duplicate)
-				{
-					// The preferred mode is also present in the fallback list. Avoid querying it twice.
-					continue;
-				}
-
-				if (render_size_in_range(streamline, candidate, input_size, requested_output))
-				{
-					selected_mode = candidate;
-					selected_output = requested_output;
-					return true;
-				}
-
-				u32 optimal_width = 0, optimal_height = 0;
-				if (!streamline.get_optimal_render_size(candidate, requested_output.width, requested_output.height,
-					optimal_width, optimal_height) || !optimal_width || !optimal_height)
-				{
-					continue;
-				}
-
-				u32 range_min_width = 0, range_min_height = 0, range_max_width = 0, range_max_height = 0;
-				const bool fixed_range = streamline.get_render_range(candidate, requested_output.width, requested_output.height,
-					range_min_width, range_min_height, range_max_width, range_max_height) &&
-					range_min_width == range_max_width && range_min_height == range_max_height;
-
-				const double bias = fixed_range ? 1.0 : 0.995;
-				const u32 candidate_width = std::max<u32>(1, static_cast<u32>(std::lround(
-					static_cast<double>(input_size.width) * requested_output.width / optimal_width * bias)));
-				const u32 candidate_height = std::max<u32>(1, static_cast<u32>(std::lround(
-					static_cast<double>(input_size.height) * requested_output.height / optimal_height * bias)));
-				const size2u candidate_output{ candidate_width, candidate_height };
-
-				if (candidate_output.width <= input_size.width || candidate_output.height <= input_size.height ||
-					!render_size_in_range(streamline, candidate, input_size, candidate_output))
-				{
-					continue;
-				}
-
-				const s64 width_delta = static_cast<s64>(candidate_width) - static_cast<s64>(requested_output.width);
-				const s64 height_delta = static_cast<s64>(candidate_height) - static_cast<s64>(requested_output.height);
-				const s64 delta = (width_delta < 0 ? -width_delta : width_delta) +
-					(height_delta < 0 ? -height_delta : height_delta);
-				if (!found || delta < best_delta)
-				{
-					found = true;
-					best_delta = delta;
-					selected_mode = candidate;
-					selected_output = candidate_output;
-				}
-			}
-
-			return found;
-		}
 
 		vk::sampler* make_temporal_sampler(std::unique_ptr<vk::sampler>& sampler)
 		{
@@ -1003,15 +896,11 @@ namespace vk
 		}
 
 		const size2u requested_output_size = output_size;
-		size2u dlss_output_size = output_size;
+		const size2u dlss_output_size = requested_output_size;
 		streamline_dlss::mode selected_dlss_mode = requested_dlss_mode;
-		bool native_configuration_valid = false;
-		if (streamline.available() &&
-			((inputs.depth && inputs.depth->value && inputs.depth->samples() == 1) || inputs.allow_dummy_depth))
-		{
-			native_configuration_valid = pick_dlss_render_size(streamline, requested_dlss_mode,
-				input_size, requested_output_size, selected_dlss_mode, dlss_output_size);
-		}
+		const dlss_preset selected_dlss_preset = g_cfg.video.dlss_preset.get();
+		bool native_configuration_valid = streamline.available() &&
+			((inputs.depth && inputs.depth->value && inputs.depth->samples() == 1) || inputs.allow_dummy_depth);
 
 		if (!m_output || !m_previous_color || !m_motion || !m_motion_meta || !m_motion_filtered || !m_motion_bias || !m_previous_motion || m_input_format != src->format() ||
 			m_previous_color->width() != src->width() ||
@@ -1042,8 +931,9 @@ namespace vk
 		native_configuration_valid &= native_output_available;
 		if (!m_configuration_logged)
 		{
-			rsx_log.notice("DLSS: temporal configuration requested_mode=%u selected_mode=%u input=%ux%u output=%ux%u native_valid=%u",
+			rsx_log.notice("DLSS: temporal configuration requested_mode=%u selected_mode=%u preset=%c input=%ux%u output=%ux%u native_valid=%u",
 				static_cast<u32>(requested_dlss_mode), static_cast<u32>(selected_dlss_mode),
+				static_cast<char>('A' + static_cast<u32>(selected_dlss_preset)),
 				input_size.width, input_size.height, dlss_output_size.width, dlss_output_size.height,
 				native_configuration_valid ? 1u : 0u);
 			m_configuration_logged = true;
@@ -1279,7 +1169,7 @@ namespace vk
 			};
 
 			if (streamline.set_options(inputs.viewport_id, selected_dlss_mode, dlss_output_size.width, dlss_output_size.height,
-				is_hdr_color_format(src->format())))
+				is_hdr_color_format(src->format()), static_cast<u32>(selected_dlss_preset)))
 			{
 				native_dlss_evaluated = streamline.evaluate(cmd, inputs.viewport_id, static_cast<u32>(vk::get_current_frame_id()), reset,
 					inputs.jitter_x, inputs.jitter_y, input_texture, output_texture, depth_texture, motion_texture,

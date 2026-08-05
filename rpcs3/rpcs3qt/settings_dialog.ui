@@ -776,7 +776,14 @@
                 <widget class="QComboBox" name="outputScalingMode"/>
                </item>
                <item>
-                <widget class="QComboBox" name="dlssQualityMode"/>
+                <widget class="QLabel" name="dlssPresetLabel">
+                 <property name="text">
+                  <string>DLSS Preset</string>
+                 </property>
+                </widget>
+               </item>
+               <item>
+                <widget class="QComboBox" name="dlssPreset"/>
                </item>
                <item>
                 <widget class="QCheckBox" name="dlssJitter">

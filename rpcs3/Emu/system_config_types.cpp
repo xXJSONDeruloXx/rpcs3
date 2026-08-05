@@ -724,6 +724,34 @@ void fmt_class_string<dlss_quality_mode>::format(std::string& out, u64 arg)
 }
 
 template <>
+void fmt_class_string<dlss_preset>::format(std::string& out, u64 arg)
+{
+	format_enum(out, arg, [](dlss_preset value)
+	{
+		switch (value)
+		{
+		case dlss_preset::a: return "A";
+		case dlss_preset::b: return "B";
+		case dlss_preset::c: return "C";
+		case dlss_preset::d: return "D";
+		case dlss_preset::e: return "E";
+		case dlss_preset::f: return "F";
+		case dlss_preset::g: return "G";
+		case dlss_preset::h: return "H";
+		case dlss_preset::i: return "I";
+		case dlss_preset::j: return "J";
+		case dlss_preset::k: return "K";
+		case dlss_preset::l: return "L";
+		case dlss_preset::m: return "M";
+		case dlss_preset::n: return "N";
+		case dlss_preset::o: return "O";
+		}
+
+		return unknown;
+	});
+}
+
+template <>
 void fmt_class_string<xfloat_accuracy>::format(std::string& out, u64 arg)
 {
 	format_enum(out, arg, [](xfloat_accuracy value)

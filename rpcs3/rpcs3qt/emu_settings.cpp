@@ -1131,6 +1131,26 @@ QString emu_settings::GetLocalizedSetting(const QString& original, emu_settings_
 		case dlss_quality_mode::native: return tr("Native (DLAA)", "DLSS Quality Mode");
 		}
 		break;
+	case emu_settings_type::DlssPreset:
+		switch (static_cast<dlss_preset>(index))
+		{
+		case dlss_preset::a: return tr("A", "DLSS Preset");
+		case dlss_preset::b: return tr("B", "DLSS Preset");
+		case dlss_preset::c: return tr("C", "DLSS Preset");
+		case dlss_preset::d: return tr("D", "DLSS Preset");
+		case dlss_preset::e: return tr("E", "DLSS Preset");
+		case dlss_preset::f: return tr("F", "DLSS Preset");
+		case dlss_preset::g: return tr("G", "DLSS Preset");
+		case dlss_preset::h: return tr("H", "DLSS Preset");
+		case dlss_preset::i: return tr("I", "DLSS Preset");
+		case dlss_preset::j: return tr("J", "DLSS Preset");
+		case dlss_preset::k: return tr("K", "DLSS Preset");
+		case dlss_preset::l: return tr("L", "DLSS Preset");
+		case dlss_preset::m: return tr("M", "DLSS Preset");
+		case dlss_preset::n: return tr("N", "DLSS Preset");
+		case dlss_preset::o: return tr("O", "DLSS Preset");
+		}
+		break;
 	case emu_settings_type::AudioRenderer:
 		switch (static_cast<audio_renderer>(index))
 		{

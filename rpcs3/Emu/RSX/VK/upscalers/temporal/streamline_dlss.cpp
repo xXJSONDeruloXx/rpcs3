@@ -360,7 +360,6 @@ namespace vk
 		m_fg_seen_depth_format = VK_FORMAT_UNDEFINED;
 		m_fg_size_stable_frames = 0;
 		m_last_fg_options = {};
-		m_options_logged = false;
 		m_evaluate_success_logged = false;
 		m_evaluate_failure_logged = false;
 		m_last_frame_token = nullptr;
@@ -410,7 +409,7 @@ namespace vk
 		return true;
 	}
 
-	bool streamline_dlss::set_options(u32 viewport_id, mode dlss_mode, u32 output_width, u32 output_height, bool hdr)
+	bool streamline_dlss::set_options(u32 viewport_id, mode dlss_mode, u32 output_width, u32 output_height, bool hdr, u32 preset)
 	{
 		if (!available() || !bind_feature_functions())
 		{
@@ -418,7 +417,7 @@ namespace vk
 		}
 
 		if (m_options_set && m_viewport_id == viewport_id && m_mode == dlss_mode && m_output_width == output_width &&
-			m_output_height == output_height && m_hdr == hdr)
+			m_output_height == output_height && m_hdr == hdr && m_preset == preset)
 		{
 			return true;
 		}
@@ -433,14 +432,16 @@ namespace vk
 		options.exposure_scale = 1.f;
 		options.color_buffers_hdr = hdr ? 1 : 0;
 		options.use_auto_exposure = 1;
-		// Use the fixed presets recommended by Streamline for each quality tier.
-		// These are option values only; RPCS3 does not ship a proprietary model.
-		options.dlaa_preset = 11;
-		options.quality_preset = 11;
-		options.balanced_preset = 11;
-		options.performance_preset = 13;
-		options.ultra_performance_preset = 12;
-		options.ultra_quality_preset = 11;
+		// Apply the user-selected letter to every DLSS quality slot. The selected
+		// mode still controls the requested input/output ratio; the preset controls
+		// which model variant Streamline uses for that ratio.
+		const u32 streamline_preset = preset + 1;
+		options.dlaa_preset = streamline_preset;
+		options.quality_preset = streamline_preset;
+		options.balanced_preset = streamline_preset;
+		options.performance_preset = streamline_preset;
+		options.ultra_performance_preset = streamline_preset;
+		options.ultra_quality_preset = streamline_preset;
 
 		const auto viewport = make_viewport(viewport_id);
 		if (m_sl_dlss_set_options(viewport, options) != 0)
@@ -448,12 +449,8 @@ namespace vk
 			rsx_log.warning("DLSS: slDLSSSetOptions failed");
 			return false;
 		}
-		if (!m_options_logged)
-		{
-			rsx_log.notice("DLSS: native options accepted mode=%u output=%ux%u hdr=%u",
-				static_cast<u32>(dlss_mode), output_width, output_height, hdr ? 1u : 0u);
-			m_options_logged = true;
-		}
+		rsx_log.notice("DLSS: native options accepted mode=%u preset=%u output=%ux%u hdr=%u",
+			static_cast<u32>(dlss_mode), streamline_preset, output_width, output_height, hdr ? 1u : 0u);
 
 		m_options_set = true;
 		m_viewport_id = viewport_id;
@@ -461,6 +458,7 @@ namespace vk
 		m_output_width = output_width;
 		m_output_height = output_height;
 		m_hdr = hdr;
+		m_preset = preset;
 		return true;
 	}
 

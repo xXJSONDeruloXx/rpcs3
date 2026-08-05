@@ -53,7 +53,7 @@ namespace vk
 		bool frame_generation_proxy_armed() const { return m_frame_generation_proxy_armed; }
 		void set_frame_generation_proxy_armed(bool armed) { m_frame_generation_proxy_armed = armed; }
 
-		bool set_options(u32 viewport_id, mode dlss_mode, u32 output_width, u32 output_height, bool hdr);
+		bool set_options(u32 viewport_id, mode dlss_mode, u32 output_width, u32 output_height, bool hdr, u32 preset);
 		bool get_optimal_render_size(mode dlss_mode, u32 output_width, u32 output_height,
 			u32& render_width, u32& render_height);
 		bool get_render_range(mode dlss_mode, u32 output_width, u32 output_height,
@@ -388,7 +388,6 @@ namespace vk
 		u32 m_fg_size_stable_frames = 0;
 		dlssg_options m_last_fg_options{};
 		bool m_fg_state_failed_logged = false;
-		bool m_options_logged = false;
 		bool m_evaluate_success_logged = false;
 		bool m_evaluate_failure_logged = false;
 		void* m_last_frame_token = nullptr;
@@ -398,6 +397,7 @@ namespace vk
 		u32 m_output_width = 0;
 		u32 m_output_height = 0;
 		bool m_hdr = false;
+		u32 m_preset = 0;
 		std::wstring m_log_path;
 		std::vector<u32> m_features;
 
