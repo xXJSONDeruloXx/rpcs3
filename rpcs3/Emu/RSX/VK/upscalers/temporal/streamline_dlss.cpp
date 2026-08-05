@@ -5,6 +5,8 @@
 #include "../../vkutils/device.h"
 #include "rpcs3_version.h"
 
+#include "Utilities/File.h"
+
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -140,6 +142,15 @@ namespace vk
 		if (!loaded)
 		{
 			loaded = m_interposer.load("sl.interposer.dll");
+		}
+
+		// Windows' default DLL search policy is not guaranteed to include the
+		// current working directory. Resolve the bundled Streamline interposer
+		// beside rpcs3.exe so launching a game from a shortcut or another cwd
+		// behaves the same as a portable install.
+		if (!loaded)
+		{
+			loaded = m_interposer.load(fs::get_executable_dir() + "/sl.interposer.dll");
 		}
 
 		if (!loaded)
