@@ -1040,6 +1040,14 @@ namespace vk
 
 		const bool native_output_available = m_native_output && m_native_output->value;
 		native_configuration_valid &= native_output_available;
+		if (!m_configuration_logged)
+		{
+			rsx_log.notice("DLSS: temporal configuration requested_mode=%u selected_mode=%u input=%ux%u output=%ux%u native_valid=%u",
+				static_cast<u32>(requested_dlss_mode), static_cast<u32>(selected_dlss_mode),
+				input_size.width, input_size.height, dlss_output_size.width, dlss_output_size.height,
+				native_configuration_valid ? 1u : 0u);
+			m_configuration_logged = true;
+		}
 
 		const bool camera_cut = m_has_history && inputs.has_camera_view_projection &&
 			m_has_previous_camera_view_projection && camera_discontinuity(

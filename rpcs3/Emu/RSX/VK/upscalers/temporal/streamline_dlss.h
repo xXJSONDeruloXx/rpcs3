@@ -388,6 +388,9 @@ namespace vk
 		u32 m_fg_size_stable_frames = 0;
 		dlssg_options m_last_fg_options{};
 		bool m_fg_state_failed_logged = false;
+		bool m_options_logged = false;
+		bool m_evaluate_success_logged = false;
+		bool m_evaluate_failure_logged = false;
 		void* m_last_frame_token = nullptr;
 		bool m_options_set = false;
 		u32 m_viewport_id = 0;

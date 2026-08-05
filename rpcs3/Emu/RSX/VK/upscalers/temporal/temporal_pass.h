@@ -141,6 +141,7 @@ namespace vk
 		float m_previous_jitter_y = 0.f;
 		bool m_has_previous_jitter = false;
 		bool m_streamline_attempted = false;
+		bool m_configuration_logged = false;
 		bool m_last_native_evaluated = false;
 		VkImage m_midframe_source = VK_NULL_HANDLE;
 		VkImage m_midframe_destination = VK_NULL_HANDLE;

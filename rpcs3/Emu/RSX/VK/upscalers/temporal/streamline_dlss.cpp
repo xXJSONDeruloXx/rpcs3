@@ -349,6 +349,9 @@ namespace vk
 		m_fg_seen_depth_format = VK_FORMAT_UNDEFINED;
 		m_fg_size_stable_frames = 0;
 		m_last_fg_options = {};
+		m_options_logged = false;
+		m_evaluate_success_logged = false;
+		m_evaluate_failure_logged = false;
 		m_last_frame_token = nullptr;
 		m_options_set = false;
 		m_sl_dlss_set_options = nullptr;
@@ -433,6 +436,12 @@ namespace vk
 		{
 			rsx_log.warning("DLSS: slDLSSSetOptions failed");
 			return false;
+		}
+		if (!m_options_logged)
+		{
+			rsx_log.notice("DLSS: native options accepted mode=%u output=%ux%u hdr=%u",
+				static_cast<u32>(dlss_mode), output_width, output_height, hdr ? 1u : 0u);
+			m_options_logged = true;
 		}
 
 		m_options_set = true;
@@ -865,15 +874,27 @@ namespace vk
 		}
 
 		void* frame_token = nullptr;
-		if (m_sl_get_new_frame_token(&frame_token, frame_index) != 0 || !frame_token)
+		const sl_result frame_token_result = m_sl_get_new_frame_token(&frame_token, frame_index);
+		if (frame_token_result != 0 || !frame_token)
 		{
+			if (!m_evaluate_failure_logged)
+			{
+				rsx_log.warning("DLSS: native evaluation could not acquire a frame token (result=%d)", frame_token_result);
+				m_evaluate_failure_logged = true;
+			}
 			return false;
 		}
 
 		const auto viewport = make_viewport(viewport_id);
 		const auto frame_constants = make_constants(output.width, output.height, motion.width, motion.height, reset, jitter_x, jitter_y);
-		if (m_sl_set_constants(frame_constants, frame_token, viewport) != 0)
+		const sl_result constants_result = m_sl_set_constants(frame_constants, frame_token, viewport);
+		if (constants_result != 0)
 		{
+			if (!m_evaluate_failure_logged)
+			{
+				rsx_log.warning("DLSS: native evaluation rejected frame constants (result=%d)", constants_result);
+				m_evaluate_failure_logged = true;
+			}
 			m_last_frame_token = nullptr;
 			return false;
 		}
@@ -901,7 +922,20 @@ namespace vk
 
 		void* inputs[] = { const_cast<viewport_handle*>(&viewport), &depth_tag, &motion_tag, &input_tag, &output_tag, &bias_tag };
 		const u32 input_count = use_bias ? 6 : 5;
-		const bool evaluated = m_sl_evaluate_feature(0, frame_token, inputs, input_count, command_buffer) == 0;
+		const sl_result evaluate_result = m_sl_evaluate_feature(0, frame_token, inputs, input_count, command_buffer);
+		const bool evaluated = evaluate_result == 0;
+		if (evaluated && !m_evaluate_success_logged)
+		{
+			rsx_log.notice("DLSS: native evaluation succeeded input=%ux%u output=%ux%u depth=%ux%u motion=%ux%u",
+				input.width, input.height, output.width, output.height, depth.width, depth.height, motion.width, motion.height);
+			m_evaluate_success_logged = true;
+		}
+		else if (!evaluated && !m_evaluate_failure_logged)
+		{
+			rsx_log.warning("DLSS: native evaluation failed (result=%d) input=%ux%u output=%ux%u depth=%ux%u motion=%ux%u",
+				evaluate_result, input.width, input.height, output.width, output.height, depth.width, depth.height, motion.width, motion.height);
+			m_evaluate_failure_logged = true;
+		}
 		m_last_frame_token = evaluated ? frame_token : nullptr;
 		return evaluated;
 	}
