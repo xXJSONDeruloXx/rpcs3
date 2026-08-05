@@ -535,6 +535,8 @@ namespace vk
 		request_supported_extension(VK_NVX_BINARY_IMPORT_EXTENSION_NAME);
 		request_supported_extension(VK_NVX_IMAGE_VIEW_HANDLE_EXTENSION_NAME);
 		request_supported_extension(VK_EXT_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
+		request_supported_extension(VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME);
+		request_supported_extension(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME);
 		request_supported_extension(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
 
 		// Enable hardware features manually
@@ -736,6 +738,8 @@ namespace vk
 		VkPhysicalDeviceVulkan12Features vulkan12_features{ .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES };
 		vulkan12_features.runtimeDescriptorArray = VK_TRUE;
 		vulkan12_features.uniformBufferStandardLayout = VK_TRUE;
+		vulkan12_features.timelineSemaphore = VK_TRUE;
+		vulkan12_features.bufferDeviceAddress = VK_TRUE;
 		vulkan12_features.pNext = const_cast<void*>(device.pNext);
 		device.pNext = &vulkan12_features;
 
