@@ -5,12 +5,42 @@
 
 #include "VKAsyncScheduler.h"
 #include "VKGSRender.h"
+#include "upscalers/temporal/camera_capture.h"
+#include "upscalers/temporal/temporal_pass.h"
 #include "vkutils/buffer_object.h"
 #include "vkutils/chip_class.h"
+#include "Emu/RSX/NV47/HW/context_accessors.define.h"
 #include <vulkan/vulkan_core.h>
 
 namespace vk
 {
+	namespace
+	{
+		bool is_hdr_injection_format(VkFormat format)
+		{
+			switch (format)
+			{
+			case VK_FORMAT_R16G16B16A16_SFLOAT:
+			case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
+			case VK_FORMAT_A2R10G10B10_UNORM_PACK32:
+				return true;
+			default:
+				return false;
+			}
+		}
+
+		u32 bit_count(u32 value)
+		{
+			u32 count = 0;
+			while (value)
+			{
+				count += value & 1u;
+				value >>= 1;
+			}
+			return count;
+		}
+	}
+
 	VkImageViewType get_view_type(rsx::texture_dimension_extended type)
 	{
 		switch (type)
@@ -950,7 +980,120 @@ bool VKGSRender::bind_interpreter_texture_env()
 	return out_of_memory;
 }
 
-void VKGSRender::emit_geometry(u32 sub_index)
+	bool VKGSRender::try_midframe_dlss_injection(const vk::vertex_upload_info& upload_info)
+	{
+		if (!g_cfg.video.dlss_mid_frame_injection.get() ||
+			g_cfg.video.output_scaling.get() != output_scaling_mode::dlss ||
+			!m_current_command_buffer || !m_draw_fbo ||
+			(m_current_command_buffer->flags & vk::command_buffer::cb_has_conditional_render) ||
+			m_current_draw.subdraw_id != 0 || is_current_program_interpreted())
+		{
+			return false;
+		}
+
+		auto& draw_call = rsx::method_registers.current_draw_clause;
+		if (!draw_call.is_single_draw() || draw_call.pass_count() != 1 || draw_call.is_trivial_instanced_draw)
+		{
+			return false;
+		}
+
+		// The Beast hook is intentionally conservative: a single fullscreen
+		// triangle/quad, one sampled source, and an HDR destination with no
+		// depth/blend side effects. This avoids treating ordinary post effects or
+		// UI quads as an upscale substitution.
+		const u32 element_count = draw_call.get_elements_count();
+		if ((draw_call.primitive != rsx::primitive_type::triangles &&
+			draw_call.primitive != rsx::primitive_type::triangle_strip &&
+			draw_call.primitive != rsx::primitive_type::quads) ||
+			(element_count != 3 && element_count != 4 && element_count != 6) ||
+			rsx::method_registers.depth_test_enabled() ||
+			rsx::method_registers.depth_write_enabled() ||
+			rsx::method_registers.stencil_test_enabled() ||
+			rsx::method_registers.blend_enabled() ||
+			rsx::method_registers.logic_op_enabled() ||
+			m_draw_buffers.size() != 1)
+		{
+			return false;
+		}
+
+		const u32 texture_mask = current_fp_metadata.referenced_textures_mask;
+		if (vk::bit_count(texture_mask) != 1)
+		{
+			return false;
+		}
+
+		u32 texture_index = 0;
+		while (!(texture_mask & (1u << texture_index)))
+		{
+			++texture_index;
+		}
+		const auto* sampler_state = fs_sampler_state[texture_index]
+			? static_cast<const vk::texture_cache::sampled_image_descriptor*>(fs_sampler_state[texture_index].get())
+			: nullptr;
+		if (!sampler_state || !sampler_state->image_handle || sampler_state->is_cyclic_reference)
+		{
+			return false;
+		}
+
+		auto* source = dynamic_cast<vk::viewable_image*>(sampler_state->image_handle->image());
+		const u8 target_index = m_draw_buffers[0];
+		auto* destination = m_rtts.m_bound_render_targets[target_index].second;
+		if (!source || !destination || source == destination || source->samples() != 1 || destination->samples() != 1 ||
+			!source->value || !destination->value || source->width() >= destination->width() ||
+			source->height() >= destination->height() || !vk::is_hdr_injection_format(source->format()) ||
+			!vk::is_hdr_injection_format(destination->format()))
+		{
+			return false;
+		}
+
+		if (!m_midframe_upscaler)
+		{
+			m_midframe_upscaler = std::make_unique<vk::dlss_upscale_pass>();
+		}
+
+		vk::temporal_frame_inputs inputs{};
+		inputs.jitter_x = m_temporal_jitter_enabled ? m_temporal_jitter_x : 0.f;
+		inputs.jitter_y = m_temporal_jitter_enabled ? -m_temporal_jitter_y : 0.f;
+		inputs.has_camera_view_projection = m_ctx && vk::temporal_camera::capture(
+			REGS(m_ctx)->transform_constants,
+			source->height() ? static_cast<float>(source->width()) / source->height() : 1.f,
+			inputs.camera_view_projection);
+
+		auto* depth = m_rtts.m_bound_depth_stencil.second;
+		if (!depth || !depth->value || depth->samples() != 1 ||
+			depth->width() != source->width() || depth->height() != source->height())
+		{
+			depth = nullptr;
+		}
+
+		if (vk::is_renderpass_open(*m_current_command_buffer))
+		{
+			vk::end_renderpass(*m_current_command_buffer);
+		}
+
+		if (auto* source_target = dynamic_cast<vk::render_target*>(source))
+		{
+			source_target->read_barrier(*m_current_command_buffer);
+		}
+		if (destination)
+		{
+			destination->write_barrier(*m_current_command_buffer);
+		}
+
+		const bool injected = m_midframe_upscaler->run_mid_frame(
+			*m_current_command_buffer, source, destination, depth, inputs);
+		if (injected)
+		{
+			// The next guest draw must start a fresh render pass and re-emit
+			// dynamic state after the compute/blit substitution.
+			m_current_command_buffer->flags |= vk::command_buffer::cb_reload_dynamic_state;
+			++m_current_draw.subdraw_id;
+		}
+
+		return injected;
+	}
+
+	void VKGSRender::emit_geometry(u32 sub_index)
 {
 	auto &draw_call = rsx::method_registers.current_draw_clause;
 	m_profiler.start();
@@ -1065,6 +1208,12 @@ void VKGSRender::emit_geometry(u32 sub_index)
 	{
 		m_program->bind_uniform(persistent_buffer, vk::glsl::binding_set_index_vertex, m_vs_binding_table->vertex_buffers_location);
 		m_program->bind_uniform(volatile_buffer, vk::glsl::binding_set_index_vertex, m_vs_binding_table->vertex_buffers_location + 1);
+	}
+
+	if (try_midframe_dlss_injection(upload_info))
+	{
+		m_frame_stats.draw_exec_time += m_profiler.duration();
+		return;
 	}
 
 	bool reload_state = (!m_current_draw.subdraw_id++);
@@ -1190,6 +1339,15 @@ void VKGSRender::emit_geometry(u32 sub_index)
 				vertex_offset += count;
 			}
 		}
+	}
+
+	// Beast's optional MV++ analogue rerenders this exact single draw against
+	// the just-written depth buffer using the previous packed transform block.
+	// It is deliberately after the authoritative guest draw so failed coverage
+	// never changes guest color/depth output.
+	if (g_cfg.video.dlss_motion_object_velocity.get())
+	{
+		try_object_motion_velocity(upload_info);
 	}
 
 	m_frame_stats.draw_exec_time += m_profiler.duration();
@@ -1363,6 +1521,7 @@ void VKGSRender::end()
 	}
 
 	m_rtts.on_write(m_framebuffer_layout.color_write_enabled, m_framebuffer_layout.zeta_write_enabled);
+	track_temporal_depth_candidate();
 
 	rsx::thread::end();
 }

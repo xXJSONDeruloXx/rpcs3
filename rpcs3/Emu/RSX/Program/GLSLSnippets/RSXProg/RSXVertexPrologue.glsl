@@ -77,7 +77,11 @@ vec4 _fetch_constant(const in uint base_offset)
 	return _fetch_constant(int(base_offset));
 }
 #elif defined(VULKAN)
+#ifdef _MVPP_OBJECT_MOTION
+#define _fetch_constant(x) (mvpp_use_previous_constants ? previous_vc[x + previous_xform_constants_offset] : vc[x + xform_constants_offset])
+#else
 #define _fetch_constant(x) vc[x + xform_constants_offset]
+#endif
 #else
 #define _fetch_constant(x) vc[x]
 #endif

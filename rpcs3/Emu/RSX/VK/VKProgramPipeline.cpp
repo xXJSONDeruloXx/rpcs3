@@ -416,6 +416,20 @@ namespace vk
 			return *this;
 		}
 
+		void program::copy_descriptor_state(const program& source)
+		{
+			for (u32 set_index = 0; set_index < binding_set_index_max_enum; ++set_index)
+			{
+				auto& destination = m_sets[set_index];
+				const auto& source_set = source.m_sets[set_index];
+				ensure(destination.m_descriptor_slots.size() == source_set.m_descriptor_slots.size());
+
+				destination.m_descriptor_slots = source_set.m_descriptor_slots;
+				destination.m_descriptors_dirty.assign(destination.m_descriptor_slots.size(), true);
+				destination.m_any_descriptors_dirty = !destination.m_descriptor_slots.empty();
+			}
+		}
+
 		void descriptor_table_t::destroy()
 		{
 			if (!m_device)

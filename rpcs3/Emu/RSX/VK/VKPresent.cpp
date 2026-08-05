@@ -5,18 +5,34 @@
 #include "Emu/RSX/Overlays/overlay_manager.h"
 #include "Emu/RSX/Overlays/overlay_debug_overlay.h"
 #include "Emu/Cell/Modules/cellVideoOut.h"
+#include "Emu/RSX/NV47/HW/context_accessors.define.h"
 
 #include "upscalers/bilinear_pass.hpp"
 #include "upscalers/fsr_pass.h"
 #include "upscalers/nearest_pass.hpp"
+#include "upscalers/temporal/camera_capture.h"
+#include "upscalers/temporal/temporal_pass.h"
 #include "util/asm.hpp"
 #include "util/video_provider.h"
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstring>
+#include <limits>
 
 extern atomic_t<bool> g_user_asked_for_screenshot;
 extern atomic_t<recording_mode> g_recording_mode;
 
 namespace
 {
+	using camera_matrix = vk::temporal_camera::matrix;
+
+	bool capture_guest_camera(const rsx::context* context, float expected_aspect, camera_matrix& result)
+	{
+		return context && vk::temporal_camera::capture(REGS(context)->transform_constants, expected_aspect, result);
+	}
+
 	VkFormat RSX_display_format_to_vk_format(u8 format)
 	{
 		switch (format)
@@ -78,10 +94,19 @@ bool VKGSRender::reinitialize_swapchain()
 	ensure(m_queued_frames.empty());
 
 	// Discard the current upscaling pipeline if any
+	vk::get_streamline_dlss().prepare_swapchain_recreation();
 	m_upscaler.reset();
+	clear_temporal_depth_candidate();
+	m_temporal_jitter_enabled = false;
+	m_temporal_jitter_x = 0.f;
+	m_temporal_jitter_y = 0.f;
+	m_temporal_jitter_render_width = 0;
+	m_temporal_jitter_render_height = 0;
+	m_temporal_jitter_index = 1;
 
 	// Drain all the queues
-	vkDeviceWaitIdle(*m_device);
+	vk::get_streamline_dlss().device_wait_idle(*m_device);
+	reset_object_motion_resources();
 
 	// Reset frame context storage
 	for (auto& ctx : m_frame_context_storage)
@@ -149,7 +174,14 @@ void VKGSRender::present(vk::frame_context_t *ctx)
 
 	if (!swapchain_unavailable)
 	{
-		switch (VkResult error = m_swapchain->present(ctx->present_wait_semaphore, ctx->present_image))
+		// Streamline's frame-generation plugins consume the same frame token
+		// that was used for DLSS-SR. These markers are no-ops unless the temporal
+		// pass successfully tagged depth and motion for this frame.
+		auto& streamline = vk::get_streamline_dlss();
+		streamline.before_present(m_device->get_present_queue());
+		const VkResult present_result = m_swapchain->present(ctx->present_wait_semaphore, ctx->present_image);
+
+		switch (present_result)
 		{
 		case VK_SUCCESS:
 			break;
@@ -164,10 +196,12 @@ void VKGSRender::present(vk::frame_context_t *ctx)
 		default:
 			// Other errors not part of rpcs3. This can be caused by 3rd party injectors with bad code, of which we have no control over.
 			// Let the application attempt to recover instead of crashing outright.
-			rsx_log.error("VkPresent returned unexpected error code %lld. Will attempt to recreate the swapchain. Please disable 3rd party injector tools.", static_cast<s64>(error));
+			rsx_log.error("VkPresent returned unexpected error code %lld. Will attempt to recreate the swapchain. Please disable 3rd party injector tools.", static_cast<s64>(present_result));
 			swapchain_unavailable = true;
 			break;
 		}
+
+		streamline.after_present();
 	}
 
 	// Presentation image released; reset value
@@ -197,6 +231,7 @@ void VKGSRender::advance_queued_frames()
 
 	m_queued_frames.push_back(m_current_frame);
 	ensure(m_queued_frames.size() <= m_max_async_frames);
+	advance_object_motion_frame();
 
 	m_current_queue_index = (m_current_queue_index + 1) % m_max_async_frames;
 	m_current_frame = &m_frame_context_storage[m_current_queue_index];
@@ -448,6 +483,7 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 
 			if (Emu.IsStopped())
 			{
+				clear_temporal_depth_candidate();
 				m_frame->flip(m_context);
 				rsx::thread::flip(info);
 				return;
@@ -487,6 +523,7 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 
 	if (info.skip_frame || swapchain_unavailable)
 	{
+		clear_temporal_depth_candidate();
 		if (!info.skip_frame)
 		{
 			ensure(swapchain_unavailable);
@@ -793,6 +830,10 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 		{
 			m_upscaler = std::make_unique<vk::fsr_upscale_pass>();
 		}
+		else if (m_output_scaling == output_scaling_mode::dlss)
+		{
+			m_upscaler = std::make_unique<vk::dlss_upscale_pass>();
+		}
 		else
 		{
 			m_upscaler = std::make_unique<vk::bilinear_upscale_pass>();
@@ -801,6 +842,62 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 
 	if (image_to_flip)
 	{
+		vk::temporal_frame_inputs temporal_inputs{};
+		if (m_output_scaling == output_scaling_mode::dlss)
+		{
+			temporal_inputs.present_width = static_cast<u32>(m_swapchain_dims.width);
+			temporal_inputs.present_height = static_cast<u32>(m_swapchain_dims.height);
+			temporal_inputs.present_buffer_count = m_swapchain->get_swap_image_count();
+			temporal_inputs.present_format = m_swapchain->get_surface_format();
+			// Streamline's Vulkan convention uses the opposite Y sign from the
+			// clip-space offset applied by the generated guest vertex shader. Keep
+			// the carrier in the declaration convention so native DLSS and the
+			// fallback's de-jitter delta stay aligned with the Beast integration.
+			temporal_inputs.jitter_x = m_temporal_jitter_enabled ? m_temporal_jitter_x : 0.f;
+			temporal_inputs.jitter_y = m_temporal_jitter_enabled ? -m_temporal_jitter_y : 0.f;
+			temporal_inputs.has_camera_view_projection = capture_guest_camera(
+				m_ctx,
+				buffer_height ? static_cast<float>(buffer_width) / buffer_height : 1.f,
+				temporal_inputs.camera_view_projection);
+
+			// The RSX depth attachment is the one piece of guest geometry data
+			// that RPCS3 already owns as a Vulkan image. Single-sample depth is
+			// accepted even when its allocation dimensions lag the color input;
+			// the temporal pass normalizes that allocation onto the color grid.
+			// The last depth attachment at present is not necessarily the scene depth:
+			// games commonly render shadow/auxiliary passes after the main camera. The
+			// draw path keeps the largest non-square single-sample depth candidate for
+			// this present interval, with a precision tie-break, matching the Beast
+			// scene-depth pinning policy. Fall back to the current binding only when no
+			// candidate was observed.
+			auto* depth = m_temporal_depth_candidate;
+			if (!depth || !depth->value || depth->samples() != 1 || depth->width() == depth->height())
+			{
+				depth = m_rtts.m_bound_depth_stencil.second;
+			}
+			if (depth && depth->samples() == 1 && depth->width() != depth->height())
+			{
+				temporal_inputs.depth = depth;
+			}
+
+			if (g_cfg.video.dlss_motion_object_velocity.get() && m_object_motion_written &&
+				m_object_motion_coverage && m_object_motion_coverage->value &&
+				m_object_motion_depth_image == depth &&
+				m_object_motion_coverage->width() == image_to_flip->width() &&
+				m_object_motion_coverage->height() == image_to_flip->height())
+			{
+				// Later guest draws may have reopened the normal render pass after an
+				// object coverage rerender. End it before sampling the coverage image.
+				if (vk::is_renderpass_open(*m_current_command_buffer))
+				{
+					vk::end_renderpass(*m_current_command_buffer);
+				}
+				m_object_motion_coverage->change_layout(*m_current_command_buffer, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+				temporal_inputs.object_motion = m_object_motion_coverage.get();
+				temporal_inputs.object_motion_valid = true;
+			}
+		}
+
 		const bool use_full_rgb_range_output = g_cfg.video.full_rgb_range_output.get();
 
 		if (!use_full_rgb_range_output || !rsx::fcmp(avconfig.gamma, 1.f) || avconfig.stereo_enabled) [[unlikely]]
@@ -808,7 +905,7 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 			if (image_to_flip) calibration_src.push_back(image_to_flip);
 			if (image_to_flip2) calibration_src.push_back(image_to_flip2);
 
-			if (m_output_scaling == output_scaling_mode::fsr && !avconfig.stereo_enabled) // 3D will be implemented later
+			if ((m_output_scaling == output_scaling_mode::fsr || m_output_scaling == output_scaling_mode::dlss) && !avconfig.stereo_enabled) // 3D will be implemented later
 			{
 				// Run upscaling pass before the rest of the output effects pipeline
 				// This can be done with all upscalers but we already get bilinear upscaling for free if we just out the filters directly
@@ -823,7 +920,14 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 				for (unsigned i = 0; i < calibration_src.size(); ++i)
 				{
 					const rsx::flags32_t mode = (i == 0) ? UPSCALE_LEFT_VIEW : UPSCALE_RIGHT_VIEW;
-					calibration_src[i] = m_upscaler->scale_output(*m_current_command_buffer, image_to_flip, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED, request, mode);
+					if (m_output_scaling == output_scaling_mode::dlss)
+					{
+						calibration_src[i] = m_upscaler->scale_output_temporal(*m_current_command_buffer, image_to_flip, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED, request, mode, temporal_inputs);
+					}
+					else
+					{
+						calibration_src[i] = m_upscaler->scale_output(*m_current_command_buffer, image_to_flip, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED, request, mode);
+					}
 				}
 			}
 
@@ -860,7 +964,14 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 				target_layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
 			}
 
-			m_upscaler->scale_output(*m_current_command_buffer, image_to_flip, target_image, target_layout, rgn, UPSCALE_AND_COMMIT | UPSCALE_DEFAULT_VIEW);
+			if (m_output_scaling == output_scaling_mode::dlss)
+			{
+				m_upscaler->scale_output_temporal(*m_current_command_buffer, image_to_flip, target_image, target_layout, rgn, UPSCALE_AND_COMMIT | UPSCALE_DEFAULT_VIEW, temporal_inputs);
+			}
+			else
+			{
+				m_upscaler->scale_output(*m_current_command_buffer, image_to_flip, target_image, target_layout, rgn, UPSCALE_AND_COMMIT | UPSCALE_DEFAULT_VIEW);
+			}
 		}
 	}
 
@@ -992,4 +1103,7 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 			flush_command_queue(true);
 		}
 	}
+
+	clear_temporal_depth_candidate();
+	advance_temporal_jitter(image_to_flip ? image_to_flip->width() : 0, image_to_flip ? image_to_flip->height() : 0);
 }

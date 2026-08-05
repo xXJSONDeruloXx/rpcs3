@@ -152,6 +152,7 @@ namespace vk
 		u32 m_graphics_queue_family = 0;
 		u32 m_present_queue_family = 0;
 		u32 m_transfer_queue_family = 0;
+		u32 m_streamline_queue_start_index = 0;
 
 		void dump_debug_info(
 			const std::vector<const char*>& requested_extensions,
@@ -201,6 +202,8 @@ namespace vk
 		u32 get_graphics_queue_family() const { return m_graphics_queue_family; }
 		u32 get_present_queue_family() const { return m_graphics_queue_family; }
 		u32 get_transfer_queue_family() const { return m_transfer_queue_family; }
+		// Streamline creates its private queues after the queues owned by RPCS3.
+		u32 get_streamline_queue_start_index() const { return m_streamline_queue_start_index; }
 
 		mem_allocator_base* get_allocator() const { return m_allocator.get(); }
 

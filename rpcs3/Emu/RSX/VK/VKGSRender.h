@@ -23,6 +23,7 @@
 #include "Emu/RSX/Host/RSXDMAWriter.h"
 #include <functional>
 #include <initializer_list>
+#include <unordered_map>
 
 using namespace vk::vmm_allocation_pool_; // clang workaround.
 using namespace vk::upscaling_flags_;     // ditto
@@ -33,6 +34,7 @@ using fs_binding_table_t = decltype(VKFragmentProgram::binding_table);
 namespace vk
 {
 	using host_data_t = rsx::host_gpu_context_t;
+	class dlss_upscale_pass;
 }
 
 class VKGSRender : public GSRender, public ::rsx::reports::ZCULL_control
@@ -67,7 +69,31 @@ private:
 	std::unique_ptr<vk::buffer_view> null_buffer_view;
 
 	std::unique_ptr<vk::upscaler> m_upscaler;
+	std::unique_ptr<vk::dlss_upscale_pass> m_midframe_upscaler;
 	output_scaling_mode m_output_scaling{output_scaling_mode::bilinear};
+
+	// Beast-compatible, explicitly experimental object/skinned motion path.
+	// The regular guest pipeline remains authoritative; this is a depth-tested
+	// coverage rerender whose RG16F result is added to the temporal motion pass.
+	std::unordered_map<u64, std::unique_ptr<vk::glsl::program>> m_object_motion_program_cache;
+	vk::glsl::program* m_object_motion_program = nullptr;
+	const VKVertexProgram* m_object_motion_vertex_program = nullptr;
+	const VKFragmentProgram* m_object_motion_fragment_program = nullptr;
+	u64 m_object_motion_pipeline_signature = 0;
+	vk::framebuffer_holder* m_object_motion_fbo = nullptr;
+	u64 m_object_motion_renderpass_key = 0;
+	vk::image* m_object_motion_depth_image = nullptr;
+	std::unique_ptr<vk::viewable_image> m_object_motion_coverage;
+	bool m_object_motion_clear_pending = true;
+	bool m_object_motion_written = false;
+
+	std::vector<u8> m_current_transform_constants;
+	u32 m_vertex_draw_parameters_offset = 0;
+	std::unordered_map<u64, std::vector<std::vector<u8>>> m_object_motion_current_snapshots;
+	std::unordered_map<u64, std::vector<std::vector<u8>>> m_object_motion_previous_snapshots;
+	std::unordered_map<u64, u32> m_object_motion_current_counts;
+	usz m_object_motion_current_snapshot_entries = 0;
+	usz m_object_motion_current_snapshot_bytes = 0;
 
 	std::unique_ptr<vk::buffer> m_cond_render_buffer;
 	u64 m_cond_render_sync_tag = 0;
@@ -114,10 +140,18 @@ private:
 
 	std::unique_ptr<vk::buffer> m_host_object_data;
 	vk::framebuffer_holder* m_draw_fbo = nullptr;
+	vk::render_target* m_temporal_depth_candidate = nullptr;
 
 	sizeu m_swapchain_dims{};
 	bool swapchain_unavailable = false;
 	bool should_reinitialize_swapchain = false;
+	bool m_streamline_fg_armed = false;
+	float m_temporal_jitter_x = 0.f;
+	float m_temporal_jitter_y = 0.f;
+	u32 m_temporal_jitter_render_width = 0;
+	u32 m_temporal_jitter_render_height = 0;
+	u32 m_temporal_jitter_index = 1;
+	bool m_temporal_jitter_enabled = false;
 
 	u64 m_last_heap_sync_time = 0;
 	u32 m_texbuffer_view_size = 0;
@@ -238,6 +272,12 @@ private:
 
 	void update_draw_state();
 	void check_present_status();
+	void track_temporal_depth_candidate();
+	void clear_temporal_depth_candidate();
+	void advance_temporal_jitter(u32 render_width, u32 render_height);
+	bool try_object_motion_velocity(const vk::vertex_upload_info& upload_info);
+	void advance_object_motion_frame();
+	void reset_object_motion_resources();
 
 	vk::vertex_upload_info upload_vertex_data();
 	rsx::simple_array<u8> m_scratch_mem;
@@ -250,6 +290,7 @@ private:
 	void load_texture_env();
 	bool bind_texture_env();
 	bool bind_interpreter_texture_env();
+	bool try_midframe_dlss_injection(const vk::vertex_upload_info& upload_info);
 
 public:
 	void init_buffers(rsx::framebuffer_creation_context context, bool skip_reading = false);

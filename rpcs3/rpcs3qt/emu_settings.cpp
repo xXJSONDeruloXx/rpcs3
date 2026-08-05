@@ -1118,6 +1118,37 @@ QString emu_settings::GetLocalizedSetting(const QString& original, emu_settings_
 		case output_scaling_mode::nearest: return tr("Nearest", "Output Scaling Mode");
 		case output_scaling_mode::bilinear: return tr("Bilinear", "Output Scaling Mode");
 		case output_scaling_mode::fsr: return tr("FidelityFX Super Resolution 1", "Output Scaling Mode");
+		case output_scaling_mode::dlss: return tr("NVIDIA DLSS Super Resolution", "Output Scaling Mode");
+		}
+		break;
+	case emu_settings_type::DlssQualityMode:
+		switch (static_cast<dlss_quality_mode>(index))
+		{
+		case dlss_quality_mode::quality: return tr("Quality", "DLSS Quality Mode");
+		case dlss_quality_mode::balanced: return tr("Balanced", "DLSS Quality Mode");
+		case dlss_quality_mode::performance: return tr("Performance", "DLSS Quality Mode");
+		case dlss_quality_mode::ultra_performance: return tr("Ultra Performance", "DLSS Quality Mode");
+		case dlss_quality_mode::native: return tr("Native (DLAA)", "DLSS Quality Mode");
+		}
+		break;
+	case emu_settings_type::DlssPreset:
+		switch (static_cast<dlss_preset>(index))
+		{
+		case dlss_preset::a: return tr("A", "DLSS Preset");
+		case dlss_preset::b: return tr("B", "DLSS Preset");
+		case dlss_preset::c: return tr("C", "DLSS Preset");
+		case dlss_preset::d: return tr("D", "DLSS Preset");
+		case dlss_preset::e: return tr("E", "DLSS Preset");
+		case dlss_preset::f: return tr("F", "DLSS Preset");
+		case dlss_preset::g: return tr("G", "DLSS Preset");
+		case dlss_preset::h: return tr("H", "DLSS Preset");
+		case dlss_preset::i: return tr("I", "DLSS Preset");
+		case dlss_preset::j: return tr("J", "DLSS Preset");
+		case dlss_preset::k: return tr("K", "DLSS Preset");
+		case dlss_preset::l: return tr("L", "DLSS Preset");
+		case dlss_preset::m: return tr("M", "DLSS Preset");
+		case dlss_preset::n: return tr("N", "DLSS Preset");
+		case dlss_preset::o: return tr("O", "DLSS Preset");
 		}
 		break;
 	case emu_settings_type::AudioRenderer:

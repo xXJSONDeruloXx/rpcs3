@@ -19,6 +19,7 @@ class VKFragmentDecompilerThread : public FragmentProgramDecompiler
 	std::vector<vk::glsl::program_input> inputs;
 	class VKFragmentProgram *vk_prog;
 	glsl::shader_properties m_shader_props{};
+	bool m_has_output0 = false;
 
 	void prepareBindingTable();
 

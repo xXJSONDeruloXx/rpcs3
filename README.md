@@ -43,6 +43,16 @@ Check our friendly [quickstart](https://rpcs3.net/quickstart) guide to make sure
 
 Don't forget to have your graphics driver up to date and to install the [Visual C++ Redistributable Packages for Visual Studio 2022](https://aka.ms/vs/17/release/VC_redist.x64.exe) if you are a Windows user.
 
+## DLSS temporal integration
+
+This experimental branch adds a Vulkan DLSS temporal resolve path. The captures below compare native scaling controls with DLSS at deliberately low render scales in *Uncharted: Drake's Fortune*; the block-stepped Nearest output makes the reconstruction difference easy to see.
+
+![DLSS comparison at 25% render scale](docs/images/dlss-scale25-comparison.png)
+
+![DLSS comparison at 50% render scale](docs/images/dlss-scale50-comparison.png)
+
+![DLSS detail comparison](docs/images/dlss-detail-comparison.png)
+
 ## License
 
 Most files are licensed under the terms of GNU GPL-2.0-only License; see LICENSE file for details. Some files may be licensed differently; check appropriate file headers for details.

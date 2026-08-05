@@ -562,6 +562,17 @@ settings_dialog::settings_dialog(std::shared_ptr<gui_settings> gui_settings, std
 	SubscribeTooltip(ui->gbZCULL, tooltips.settings.zcull_operation_mode);
 
 	EnhanceComboBox(emu_settings_type::OutputScalingMode, ui->outputScalingMode, tooltips.settings.output_scaling_mode);
+	EnhanceComboBox(emu_settings_type::DlssPreset, ui->dlssPreset, tooltips.settings.output_scaling_mode);
+	EnhanceCheckBox(emu_settings_type::DlssJitter, ui->dlssJitter, tooltips.settings.output_scaling_mode);
+	EnhanceCheckBox(emu_settings_type::DlssMotionBias, ui->dlssMotionBias, tooltips.settings.output_scaling_mode);
+	EnhanceCheckBox(emu_settings_type::DlssMotionDynamicMask, ui->dlssMotionDynamicMask, tooltips.settings.output_scaling_mode);
+	EnhanceCheckBox(emu_settings_type::DlssMotionFarRotation, ui->dlssMotionFarRotation, tooltips.settings.output_scaling_mode);
+	m_emu_settings->EnhanceSpinBox(ui->dlssMotionEdgeMode, emu_settings_type::DlssMotionEdgeMode);
+	EnhanceCheckBox(emu_settings_type::DlssMotionObjectVelocity, ui->dlssMotionObjectVelocity, tooltips.settings.output_scaling_mode);
+	EnhanceCheckBox(emu_settings_type::DlssMidFrameInjection, ui->dlssMidFrameInjection, tooltips.settings.output_scaling_mode);
+	EnhanceCheckBox(emu_settings_type::DlssFrameGeneration, ui->dlssFrameGeneration, tooltips.settings.output_scaling_mode);
+	EnhanceCheckBox(emu_settings_type::DlssFrameGenerationRawMotion, ui->dlssFrameGenerationRawMotion, tooltips.settings.output_scaling_mode);
+	m_emu_settings->EnhanceSpinBox(ui->dlssFrameGenerationFrames, emu_settings_type::DlssFrameGenerationFrames);
 
 	// 3D
 	EnhanceComboBox(emu_settings_type::StereoRenderMode, ui->stereoRenderMode, tooltips.settings.stereo_render_mode, ui->gb_stereo);
@@ -849,6 +860,18 @@ settings_dialog::settings_dialog(std::shared_ptr<gui_settings> gui_settings, std
 		const bool fsr_selected = static_cast<output_scaling_mode>(value) == output_scaling_mode::fsr;
 		ui->fsrSharpeningStrength->setEnabled(fsr_selected);
 		ui->fsrSharpeningStrengthReset->setEnabled(fsr_selected);
+		const bool dlss_selected = static_cast<output_scaling_mode>(value) == output_scaling_mode::dlss;
+		ui->dlssPreset->setEnabled(dlss_selected);
+		ui->dlssJitter->setEnabled(dlss_selected);
+		ui->dlssMotionBias->setEnabled(dlss_selected);
+		ui->dlssMotionDynamicMask->setEnabled(dlss_selected);
+		ui->dlssMotionFarRotation->setEnabled(dlss_selected);
+		ui->dlssMotionEdgeMode->setEnabled(dlss_selected);
+		ui->dlssMotionObjectVelocity->setEnabled(dlss_selected);
+		ui->dlssMidFrameInjection->setEnabled(dlss_selected);
+		ui->dlssFrameGeneration->setEnabled(dlss_selected);
+		ui->dlssFrameGenerationRawMotion->setEnabled(dlss_selected && ui->dlssFrameGeneration->isChecked());
+		ui->dlssFrameGenerationFrames->setEnabled(dlss_selected && ui->dlssFrameGeneration->isChecked());
 	};
 
 	// Handle connects to disable specific checkboxes that depend on GUI state.
@@ -858,6 +881,12 @@ settings_dialog::settings_dialog(std::shared_ptr<gui_settings> gui_settings, std
 	connect(ui->renderBox, &QComboBox::currentTextChanged, apply_renderer_specific_options);
 	connect(ui->renderBox, &QComboBox::currentTextChanged, this, apply_fsr_specific_options);
 	connect(ui->outputScalingMode, &QComboBox::currentIndexChanged, this, apply_fsr_specific_options);
+	connect(ui->dlssFrameGeneration, &QCheckBox::checkStateChanged, this, [this](Qt::CheckState)
+	{
+		const auto [text, value] = get_data(ui->outputScalingMode, ui->outputScalingMode->currentIndex());
+		ui->dlssFrameGenerationFrames->setEnabled(static_cast<output_scaling_mode>(value) == output_scaling_mode::dlss && ui->dlssFrameGeneration->isChecked());
+		ui->dlssFrameGenerationRawMotion->setEnabled(static_cast<output_scaling_mode>(value) == output_scaling_mode::dlss && ui->dlssFrameGeneration->isChecked());
+	});
 
 	//                      _ _         _______    _
 	//       /\            | (_)       |__   __|  | |

@@ -776,6 +776,98 @@
                 <widget class="QComboBox" name="outputScalingMode"/>
                </item>
                <item>
+                <widget class="QLabel" name="dlssPresetLabel">
+                 <property name="text">
+                  <string>DLSS Preset</string>
+                 </property>
+                </widget>
+               </item>
+               <item>
+                <widget class="QComboBox" name="dlssPreset"/>
+               </item>
+               <item>
+                <widget class="QCheckBox" name="dlssJitter">
+                 <property name="text">
+                  <string>Enable DLSS Rendering Jitter</string>
+                 </property>
+                </widget>
+               </item>
+               <item>
+               <widget class="QCheckBox" name="dlssMotionBias">
+                <property name="text">
+                 <string>Use DLSS Motion Bias Mask</string>
+                </property>
+               </widget>
+              </item>
+              <item>
+               <widget class="QCheckBox" name="dlssMotionDynamicMask">
+                <property name="text">
+                 <string>Mask Dynamic/Disoccluded Motion</string>
+                </property>
+               </widget>
+              </item>
+              <item>
+               <widget class="QCheckBox" name="dlssMotionFarRotation">
+                <property name="text">
+                 <string>Use Far-Depth Camera Rotation</string>
+                </property>
+               </widget>
+              </item>
+              <item>
+               <widget class="QSpinBox" name="dlssMotionEdgeMode">
+                <property name="minimum">
+                 <number>0</number>
+                </property>
+                <property name="maximum">
+                 <number>2</number>
+                </property>
+                <property name="prefix">
+                 <string>Motion edge policy: </string>
+                </property>
+               </widget>
+              </item>
+              <item>
+               <widget class="QCheckBox" name="dlssMotionObjectVelocity">
+                <property name="text">
+                 <string>Experimental Object/Skinned Motion Velocity</string>
+                </property>
+               </widget>
+              </item>
+              <item>
+               <widget class="QCheckBox" name="dlssMidFrameInjection">
+                <property name="text">
+                 <string>Enable Experimental Mid-Frame Injection</string>
+                </property>
+               </widget>
+              </item>
+              <item>
+               <widget class="QCheckBox" name="dlssFrameGeneration">
+                 <property name="text">
+                  <string>Enable DLSS Frame Generation</string>
+                 </property>
+                </widget>
+               </item>
+               <item>
+                <widget class="QCheckBox" name="dlssFrameGenerationRawMotion">
+                 <property name="text">
+                  <string>Use Raw Motion for Frame Generation</string>
+                 </property>
+                </widget>
+               </item>
+               <item>
+                <widget class="QSpinBox" name="dlssFrameGenerationFrames">
+                 <property name="minimum">
+                  <number>1</number>
+                 </property>
+                 <property name="maximum">
+                  <number>5</number>
+                 </property>
+                 <property name="prefix">
+                  <string>Generated frames: </string>
+                 </property>
+                </widget>
+               </item>
+               <item>
                 <widget class="Line" name="line">
                  <property name="orientation">
                   <enum>Qt::Orientation::Horizontal</enum>

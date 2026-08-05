@@ -58,6 +58,10 @@ void VKVertexDecompilerThread::prepareBindingTable()
 				if (!(m_prog.ctrl & RSX_SHADER_CONTROL_INSTANCED_CONSTANTS))
 				{
 					vk_prog->binding_table.cbuf_location = location++;
+					if (!(m_prog.ctrl & RSX_SHADER_CONTROL_INTERPRETER_MODEL))
+					{
+						vk_prog->binding_table.previous_cbuf_location = location++;
+					}
 					continue;
 				}
 
@@ -136,7 +140,8 @@ void VKVertexDecompilerThread::insertHeader(std::stringstream& OS)
 		.type = vk::glsl::input_type_storage_buffer,
 		.set = vk::glsl::binding_set_index_vertex,
 		.location = vk_prog->binding_table.vertex_buffers_location + 2,
-		.name = "DrawParametersBuffer"
+		.name = "DrawParametersBuffer",
+		.ex_stages = VK_SHADER_STAGE_FRAGMENT_BIT
 	};
 	inputs.push_back(std::move(layouts_input));
 
@@ -144,13 +149,17 @@ void VKVertexDecompilerThread::insertHeader(std::stringstream& OS)
 		"layout(push_constant) uniform push_constants_block\n"
 		"{\n"
 		"	uint draw_parameters_offset;\n"
+		"	uint object_motion_mode;\n"
+		"	uint previous_xform_constants_offset;\n"
 		"};\n\n";
+
+	OS << "bool mvpp_use_previous_constants = false;\n\n";
 
 	vk::glsl::program_input push_constants
 	{
 		.domain = glsl::glsl_vertex_program,
 		.type = vk::glsl::input_type_push_constant,
-		.bound_data = vk::glsl::push_constant_ref{ .offset = 0, .size = 4 },
+		.bound_data = vk::glsl::push_constant_ref{ .offset = 0, .size = 12 },
 		.set = vk::glsl::binding_set_index_vertex,
 		.location = umax,
 		.name = "push_constants_block"
@@ -208,6 +217,20 @@ void VKVertexDecompilerThread::insertConstants(std::stringstream& OS, const std:
 					in.type = vk::glsl::input_type_uniform_buffer;
 
 					inputs.push_back(in);
+
+					if (vk_prog->binding_table.previous_cbuf_location != umax)
+					{
+						OS << "layout(std430, set=0, binding=" << vk_prog->binding_table.previous_cbuf_location << ") uniform PreviousVertexConstantsBuffer\n";
+						OS << "{\n";
+						OS << "\tvec4 previous_vc[];\n";
+						OS << "};\n\n";
+						OS << "#define _MVPP_OBJECT_MOTION 1\n\n";
+
+						in.location = vk_prog->binding_table.previous_cbuf_location;
+						in.name = "PreviousVertexConstantsBuffer";
+						in.type = vk::glsl::input_type_uniform_buffer;
+						inputs.push_back(in);
+					}
 					continue;
 				}
 				else
@@ -314,12 +337,22 @@ void VKVertexDecompilerThread::insertOutputs(std::stringstream& OS, const std::v
 
 	if (!(m_prog.ctrl & RSX_SHADER_CONTROL_INTERPRETER_MODEL))
 	{
-		OS << "layout(location=" << vk::get_varying_register_location("usr") << ") out flat uvec4 draw_params_payload;\n";
+		// The old draw-parameter varying occupied the last user location. Native
+		// fragment programs now read those values from the already-bound draw
+		// parameter SSBO, leaving this location available for a packed pair of
+		// current/previous NDC positions. noperspective is exact here: projected
+		// screen coordinates are affine in rasterizer barycentric space.
+		OS << "layout(location=15) noperspective out vec4 mvpp_clip;\n";
 	}
 }
 
 void VKVertexDecompilerThread::insertFSExport(std::stringstream& OS)
 {
+	if (!(m_prog.ctrl & RSX_SHADER_CONTROL_INTERPRETER_MODEL))
+	{
+		return;
+	}
+
 	OS <<
 		"void write_fs_payload()\n"
 		"{\n"
@@ -430,10 +463,16 @@ void VKVertexDecompilerThread::insertMainEnd(std::stringstream& OS)
 		OS << "}\n\n";
 	}
 
-	OS << "	vs_main();\n\n";
+	OS << "	vec4 mvpp_previous_raw_clip = vec4(0.0);\n";
+	OS << "	if (object_motion_mode != 0u)\n";
+	OS << "	{\n";
+	OS << "		mvpp_use_previous_constants = true;\n";
+	OS << "		vs_main();\n";
+	OS << "		mvpp_previous_raw_clip = gl_Position;\n";
+	OS << "		mvpp_use_previous_constants = false;\n";
+	OS << "	}\n\n";
 
-	// FS payload
-	OS << "write_fs_payload();\n\n";
+	OS << "	vs_main();\n\n";
 
 	for (auto &i : reg_table)
 	{
@@ -471,7 +510,18 @@ void VKVertexDecompilerThread::insertMainEnd(std::stringstream& OS)
 		}
 	}
 
-	OS << "	gl_Position = gl_Position * scale_offset_mat;\n";
+	OS << "	vec4 mvpp_current_scaled_clip = gl_Position * scale_offset_mat;\n";
+	OS << "	vec4 mvpp_previous_scaled_clip = mvpp_previous_raw_clip * scale_offset_mat;\n";
+	OS << "	vec4 mvpp_current_no_jitter = apply_zclip_xform(mvpp_current_scaled_clip, z_near, z_far);\n";
+	OS << "	vec4 mvpp_previous_no_jitter = apply_zclip_xform(mvpp_previous_scaled_clip, z_near, z_far);\n";
+	OS << "	if (object_motion_mode == 0u) mvpp_previous_no_jitter = mvpp_current_no_jitter;\n";
+	OS << "	float mvpp_current_w = abs(mvpp_current_no_jitter.w) > 1e-5 ? mvpp_current_no_jitter.w : 1.0;\n";
+	OS << "	float mvpp_previous_w = abs(mvpp_previous_no_jitter.w) > 1e-5 ? mvpp_previous_no_jitter.w : 1.0;\n";
+	OS << "	mvpp_clip = vec4(mvpp_current_no_jitter.xy / mvpp_current_w, mvpp_previous_no_jitter.xy / mvpp_previous_w);\n";
+	OS << "	gl_Position = mvpp_current_scaled_clip;\n";
+	OS << "	if (get_vertex_context().reserved[2] > 0.5) {\n";
+	OS << "		gl_Position.xy += vec2(get_vertex_context().reserved[0], get_vertex_context().reserved[1]) * gl_Position.w;\n";
+	OS << "	}\n";
 	OS << "	gl_Position = apply_zclip_xform(gl_Position, z_near, z_far);\n";
 	OS << "}\n";
 }

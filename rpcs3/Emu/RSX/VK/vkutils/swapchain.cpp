@@ -133,17 +133,52 @@ namespace vk
 		}
 	}
 
-	void swapchain_WSI::destroy(bool)
+	void swapchain_WSI::destroy(bool full)
 	{
 		if (VkDevice pdev = dev)
 		{
 			if (m_vk_swapchain)
 			{
 				_vkDestroySwapchainKHR(pdev, m_vk_swapchain, nullptr);
+				m_vk_swapchain = VK_NULL_HANDLE;
 			}
 
-			dev.destroy();
+			swapchain_images.clear();
+
+			if (full)
+			{
+				dev.destroy();
+			}
 		}
+	}
+
+	bool swapchain_WSI::install_streamline_proxies(device_proc_resolver resolver)
+	{
+		if (!resolver)
+		{
+			return false;
+		}
+
+		const VkDevice device = dev;
+		const auto create_swapchain = reinterpret_cast<PFN_vkCreateSwapchainKHR>(resolver(device, "vkCreateSwapchainKHR"));
+		const auto destroy_swapchain = reinterpret_cast<PFN_vkDestroySwapchainKHR>(resolver(device, "vkDestroySwapchainKHR"));
+		const auto get_swapchain_images = reinterpret_cast<PFN_vkGetSwapchainImagesKHR>(resolver(device, "vkGetSwapchainImagesKHR"));
+		const auto acquire_next_image = reinterpret_cast<PFN_vkAcquireNextImageKHR>(resolver(device, "vkAcquireNextImageKHR"));
+		const auto queue_present = reinterpret_cast<PFN_vkQueuePresentKHR>(resolver(device, "vkQueuePresentKHR"));
+
+		if (!create_swapchain || !destroy_swapchain || !get_swapchain_images || !acquire_next_image || !queue_present)
+		{
+			rsx_log.warning("DLSS-FG: Streamline Vulkan proxy did not expose the complete swapchain function set");
+			return false;
+		}
+
+		_vkCreateSwapchainKHR = create_swapchain;
+		_vkDestroySwapchainKHR = destroy_swapchain;
+		_vkGetSwapchainImagesKHR = get_swapchain_images;
+		_vkAcquireNextImageKHR = acquire_next_image;
+		_vkQueuePresentKHR = queue_present;
+		m_streamline_proxy_installed = true;
+		return true;
 	}
 
 	std::pair<VkSurfaceCapabilitiesKHR, bool> swapchain_WSI::init_surface_capabilities()
@@ -200,6 +235,15 @@ namespace vk
 		}
 
 		VkSwapchainKHR old_swapchain = m_vk_swapchain;
+		VkSwapchainKHR old_swapchain_to_destroy = VK_NULL_HANDLE;
+		if (m_streamline_proxy_installed && old_swapchain)
+		{
+			// Streamline's manual Vulkan hook path requires the new chain to be
+			// created with oldSwapchain = VK_NULL_HANDLE. Retire the previous
+			// chain only after all surface validation below has succeeded.
+			old_swapchain_to_destroy = old_swapchain;
+			old_swapchain = VK_NULL_HANDLE;
+		}
 		vk::physical_device& gpu = const_cast<vk::physical_device&>(dev.gpu());
 
 		auto [surface_descriptors, should_specify_exclusive_full_screen_mode] = init_surface_capabilities();
@@ -234,7 +278,14 @@ namespace vk
 		VkPresentModeKHR swapchain_present_mode = VK_PRESENT_MODE_FIFO_KHR;
 		std::vector<VkPresentModeKHR> preferred_modes;
 
-		switch (g_cfg.video.vsync)
+		if (m_streamline_proxy_installed)
+		{
+			// DLSS-G needs a present path it can pace itself. FIFO's compositor
+			// wait prevents current Streamline builds from injecting reliably;
+			// prefer immediate and retain mailbox as the low-latency fallback.
+			preferred_modes = { VK_PRESENT_MODE_IMMEDIATE_KHR, VK_PRESENT_MODE_MAILBOX_KHR };
+		}
+		else switch (g_cfg.video.vsync)
 		{
 		case vsync_mode::off:
 			preferred_modes = { VK_PRESENT_MODE_IMMEDIATE_KHR, VK_PRESENT_MODE_MAILBOX_KHR, VK_PRESENT_MODE_FIFO_RELAXED_KHR };
@@ -322,6 +373,13 @@ namespace vk
 
 		rsx_log.notice("Swapchain: requesting full screen exclusive mode %d.", static_cast<int>(full_screen_exclusive_info.fullScreenExclusive));
 #endif
+
+		if (old_swapchain_to_destroy)
+		{
+			_vkDestroySwapchainKHR(dev, old_swapchain_to_destroy, nullptr);
+			m_vk_swapchain = VK_NULL_HANDLE;
+			swapchain_images.clear();
+		}
 
 		_vkCreateSwapchainKHR(dev, &swap_info, nullptr, &m_vk_swapchain);
 
